@@ -60,7 +60,10 @@
     endHookPatched: false,
     currentNonce: null,
     isHostRuntime: false,
+    isPickingLevel: false,
     snapshotTimer: 0,
+    localProgressBackup: null,
+    progressSaveOriginal: null,
     syncMaps: {
       deviceBodyToId: new Map(),
       bodyIdToDeviceBody: new Map(),
@@ -337,16 +340,25 @@
       roles.includes("wg") &&
       room.selectedTempleId &&
       room.selectedLevelId;
+    const selectedOption =
+      room.selectedTempleId && room.selectedLevelId
+        ? findLevelOption(room.selectedTempleId, room.selectedLevelId)
+        : null;
 
     elements.roomCodeText.textContent = room.code;
     elements.roomRoleText.textContent = isHost ? "你是房主" : "你是成员";
     elements.roomStateText.textContent = ROOM_STATE_LABELS[room.game?.status] || "房间中";
     elements.onlineProgressCount.textContent = `${room.progress?.completedLevels?.length || 0} 关`;
-    elements.startOnlineBtn.disabled = !isHost || !readyToStart;
+    elements.startOnlineBtn.disabled = !isHost || (!!room.selectedTempleId && !readyToStart);
     elements.retryOnlineBtn.disabled = !room.selectedTempleId || !room.selectedLevelId;
     elements.resetOnlineBtn.disabled = !isHost;
     elements.copyRoomBtn.disabled = !room.code;
     elements.roomCodeInput.value = room.code;
+    elements.startOnlineBtn.textContent = room.selectedTempleId ? "开始联机关卡" : "进入原版选关";
+
+    if (selectedOption) {
+      elements.roomStateText.textContent = `${ROOM_STATE_LABELS[room.game?.status] || "房间中"} · ${selectedOption.label}`;
+    }
 
     if (me) {
       app.selectedRole = me.role || null;
@@ -463,6 +475,80 @@
     return player?.role || null;
   }
 
+  function cloneJson(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+
+  function backupLocalProgress(game) {
+    if (!game?.progress) {
+      return;
+    }
+    if (!app.localProgressBackup) {
+      app.localProgressBackup = cloneJson(game.progress.toJSON());
+    }
+    if (!app.progressSaveOriginal) {
+      app.progressSaveOriginal = game.progress.save.bind(game.progress);
+    }
+  }
+
+  function setProgressSaveSuppressed(game, suppressed) {
+    if (!game?.progress) {
+      return;
+    }
+    if (!app.progressSaveOriginal) {
+      app.progressSaveOriginal = game.progress.save.bind(game.progress);
+    }
+    game.progress.save = suppressed ? function () { return null; } : app.progressSaveOriginal;
+  }
+
+  function applyRoomProgressToGame(game, roomProgress) {
+    if (!game?.progress) {
+      return;
+    }
+
+    backupLocalProgress(game);
+
+    const temples = cloneJson(game.progress.get("temples"));
+    const completed = new Set(roomProgress?.completedLevels || []);
+
+    temples.forEach(function (temple) {
+      delete temple.hasNew;
+      delete temple.completedCount;
+      (temple.levels || []).forEach(function (level) {
+        delete level.best;
+        delete level.played;
+        delete level.isNew;
+        delete level.state;
+
+        if (completed.has(`${temple.id}:${level.id}`)) {
+          level.best = {
+            stars: 3,
+            diamonds: 0,
+            time: 0,
+          };
+          level.played = true;
+        }
+      });
+    });
+
+    setProgressSaveSuppressed(game, true);
+    game.progress.set("gameComplete", false);
+    game.progress.set("gameTotalComplete", false);
+    game.progress.set("temples", temples);
+    game.progress.process();
+  }
+
+  function restoreLocalProgress(game) {
+    if (!game?.progress || !app.localProgressBackup) {
+      return;
+    }
+
+    game.progress.set(cloneJson(app.localProgressBackup));
+    setProgressSaveSuppressed(game, false);
+    game.progress.process();
+    app.localProgressBackup = null;
+  }
+
   function getRemoteRole() {
     return app.selectedRole === "fb" ? "wg" : app.selectedRole === "wg" ? "fb" : null;
   }
@@ -568,6 +654,67 @@
     });
   }
 
+  function createOnlineCursorProxy(sourceState, isLocal) {
+    const proxy = {
+      left: {},
+      right: {},
+      up: {},
+      show: function () {},
+      hide: function () {},
+      layoutContent: function () {},
+      destroy: function () {},
+    };
+
+    Object.defineProperty(proxy.left, "isDown", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return !!sourceState.left;
+      },
+    });
+
+    Object.defineProperty(proxy.right, "isDown", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return !!sourceState.right;
+      },
+    });
+
+    Object.defineProperty(proxy.up, "isDown", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return !!sourceState.up;
+      },
+    });
+
+    Object.defineProperty(proxy, "active", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return isLocal && (!!sourceState.left || !!sourceState.right || !!sourceState.up);
+      },
+      set: function () {},
+    });
+
+    return proxy;
+  }
+
+  function beginOnlineLevelPick() {
+    const game = getGame();
+    if (!game || !app.currentRoom) {
+      return;
+    }
+
+    app.isPickingLevel = true;
+    game.__onlinePickingLevel = true;
+    game.__onlineMode = false;
+    applyRoomProgressToGame(game, app.currentRoom.progress);
+    hideLobby();
+    game.state.fade("menu", true, false);
+  }
+
   function startSingleMode() {
     setStatus(elements.singleStatus, "");
     hideLobby();
@@ -578,6 +725,8 @@
       return;
     }
 
+    restoreLocalProgress(game);
+    game.__onlinePickingLevel = false;
     game.__onlineMode = false;
     game.settings.controls = "keyboard";
     if (typeof game.saveSettings === "function") {
@@ -608,7 +757,11 @@
     app.remoteInputState = { left: false, right: false, up: false };
     app.localInputState = { left: false, right: false, up: false };
     app.isHostRuntime = room.hostId === app.clientId;
+    app.isPickingLevel = false;
+    backupLocalProgress(game);
+    setProgressSaveSuppressed(game, true);
     game.__onlineMode = true;
+    game.__onlinePickingLevel = false;
     game.__onlineRoomCode = room.code;
     game.__onlineNonce = app.currentNonce;
     game.__onlineSelectedRole = app.selectedRole;
@@ -648,20 +801,20 @@
       if (this.cursorToggle) {
         this.cursorToggle.visible = false;
       }
-      if (this.pers1 && this.pers1.cursors.buttons) {
-        this.pers1.cursors.hide();
+      const localRole = this.game.__onlineSelectedRole;
+      const oldPers1Cursors = this.pers1?.cursors;
+      const oldPers2Cursors = this.pers2?.cursors;
+      if (oldPers1Cursors?.destroy) {
+        oldPers1Cursors.destroy();
       }
-      if (this.pers2 && this.pers2.cursors.buttons) {
-        this.pers2.cursors.hide();
+      if (oldPers2Cursors?.destroy) {
+        oldPers2Cursors.destroy();
       }
 
-      const localRole = this.game.__onlineSelectedRole;
-      const remoteRole = localRole === "fb" ? "wg" : "fb";
-      if (localRole === "fb") {
-        this.pers2.cursors.active = false;
-      } else {
-        this.pers1.cursors.active = false;
-      }
+      const localCursorProxy = createOnlineCursorProxy(app.localInputState, true);
+      const remoteCursorProxy = createOnlineCursorProxy(app.remoteInputState, false);
+      this.pers1.cursors = localRole === "fb" ? localCursorProxy : remoteCursorProxy;
+      this.pers2.cursors = localRole === "wg" ? localCursorProxy : remoteCursorProxy;
 
       app.syncMaps.playerBodyByRole = {
         fb: this.pers1?.body?.data || null,
@@ -845,9 +998,12 @@
     }
 
     app.currentNonce = null;
+    app.isPickingLevel = false;
     app.remoteInputState = { left: false, right: false, up: false };
     app.localInputState = { left: false, right: false, up: false };
+    game.__onlinePickingLevel = false;
     game.__onlineMode = false;
+    restoreLocalProgress(game);
     if (game.state.current === "level" || game.state.current === "endGame") {
       game.state.fade("menu", true, false);
     }
@@ -932,6 +1088,52 @@
     app.endHookPatched = true;
   }
 
+  function patchOnlineLevelPicker(game) {
+    if (app.pauseHookPatched) {
+      return;
+    }
+
+    const MenuClass = game.require("States/Menu/Menu");
+    const LevelMenuClass = game.require("States/LevelMenu/LevelMenu");
+    const originalStartTemple = MenuClass.prototype.startTemple;
+    const originalStartLevel = LevelMenuClass.prototype.startLevel;
+    const originalGoBack = LevelMenuClass.prototype.goBack;
+
+    MenuClass.prototype.startTemple = function (templeData) {
+      if (this.game.__onlinePickingLevel) {
+        this.game.__onlinePickingTemple = cloneJson(templeData);
+      }
+      return originalStartTemple.call(this, templeData);
+    };
+
+    LevelMenuClass.prototype.startLevel = function (button) {
+      if (this.game.__onlinePickingLevel) {
+        send({
+          type: "select_level",
+          templeId: this.templeData.id,
+          levelId: String(button.data.id),
+        });
+        app.isPickingLevel = false;
+        this.game.__onlinePickingLevel = false;
+        showLobby();
+        this.game.state.fade("menu", true, false);
+        return;
+      }
+      return originalStartLevel.call(this, button);
+    };
+
+    LevelMenuClass.prototype.goBack = function () {
+      if (this.game.__onlinePickingLevel) {
+        showLobby();
+        this.game.state.fade("menu", true, false);
+        return;
+      }
+      return originalGoBack.call(this);
+    };
+
+    app.pauseHookPatched = true;
+  }
+
   function handleRemoteLevelComplete(message) {
     if (app.isHostRuntime || message.nonce !== app.currentNonce) {
       return;
@@ -988,9 +1190,9 @@
       return window.require(moduleName);
     };
 
-    ensureRoleInputPatch(game);
     patchLevelState(game);
     patchEndState(game);
+    patchOnlineLevelPicker(game);
     installKeyboardInputSync();
     game.__networkLobbyPatched = true;
   }
@@ -1027,10 +1229,15 @@
     elements.leaveRoomBtn.addEventListener("click", function () {
       send({ type: "leave_room" });
       app.currentRoom = null;
+      app.isPickingLevel = false;
       renderRoomPanel();
     });
 
     elements.startOnlineBtn.addEventListener("click", function () {
+      if (app.currentRoom?.hostId === app.clientId && !app.currentRoom?.selectedTempleId) {
+        beginOnlineLevelPick();
+        return;
+      }
       send({ type: "start_level" });
     });
 
