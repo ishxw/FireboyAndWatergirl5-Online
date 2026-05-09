@@ -1,0 +1,178 @@
+﻿<!doctype html>
+<!--[if lt IE 7]>      <html class="no-js lt-ie9 lt-ie8 lt-ie7"> <![endif]-->
+<!--[if IE 7]>         <html class="no-js lt-ie9 lt-ie8"> <![endif]-->
+<!--[if IE 8]>         <html class="no-js lt-ie9"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js"> <!--<![endif]-->
+    <head>
+
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <meta http-equiv="cache-control" content="no-cache">
+        <meta http-equiv="expires" content="0">
+        <meta http-equiv="pragma" content="no-cache">
+        
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no, viewport-fit=contain">
+        <title>Fireboy &amp; Watergirl Elements</title>
+
+        <meta name="description" content="">
+
+        <!-- Place favicon.ico and apple-touch-icon.png in the root directory -->
+
+        <link rel="manifest" href="manifest.json">
+        <link rel="icon" sizes="60x60" href="icon-60x60.png">
+        <link rel="icon" sizes="256x256" href="icon-256x256.png">
+        <link rel="icon" sizes="512x512" href="icon-512x512.png">
+        <link rel="apple-touch-icon" href="icon-60x60.png">
+        <link rel="stylesheet" href="css/lobby.css">
+       
+
+        <meta name="apple-mobile-web-app-title" content="Fireboy &amp; Watergirl Elements">
+
+        <!-- Browser mode: skip WinJS/Cordova runtime scripts that require Windows app APIs. -->
+
+
+    </head>
+
+    <body style="margin: 0px">
+
+        <script type="text/javascript">
+            window.requireNode = window.require;
+            window.require = undefined; 
+        </script>
+        
+        <!-- build:js scripts/main.js -->
+        <script data-main="js/init.js" src="bower_components/requirejs/require.js"></script>
+        <!-- endbuild -->
+        
+        <div id="root">
+            <div id="container"></div>
+            <div id="hammer"></div>
+            <div id="debug-fps" style="color:#ff0000; position: absolute; top: 0;"></div>
+        </div>
+
+        <div id="lobby-root" class="visible">
+            <div class="lobby-shell">
+                <div class="lobby-card">
+                    <h1 class="lobby-title">Fireboy &amp; Watergirl</h1>
+                    <p class="lobby-subtitle">
+                        选择单人或联机模式。联机模式支持房间选关、双人选角、房间进度保存与手动重置；单人模式保留当前玩法，并支持手动重置本地关卡进度。
+                    </p>
+
+                    <div class="lobby-grid">
+                        <section class="panel">
+                            <h2 class="panel-title">模式选择</h2>
+                            <div class="mode-grid" id="mode-grid"></div>
+
+                            <div class="hidden" id="single-panel">
+                                <h2 class="panel-title">单人模式</h2>
+                                <div class="action-grid">
+                                    <button class="btn btn-primary" id="single-start-btn" type="button">进入单人模式</button>
+                                    <button class="btn btn-danger" id="single-reset-btn" type="button">重置单人进度</button>
+                                </div>
+                                <div class="status-line" id="single-status"></div>
+                            </div>
+
+                            <div class="hidden" id="online-panel">
+                                <h2 class="panel-title">联机房间</h2>
+
+                                <label class="field-label" for="player-name-input">玩家昵称</label>
+                                <input class="text-input" id="player-name-input" maxlength="16" placeholder="输入你的昵称">
+
+                                <div style="height: 12px"></div>
+
+                                <div class="action-grid">
+                                    <button class="btn btn-primary" id="create-room-btn" type="button">创建房间</button>
+                                    <button class="btn btn-secondary" id="join-room-btn" type="button">加入房间</button>
+                                </div>
+
+                                <div style="height: 12px"></div>
+
+                                <div class="room-grid">
+                                    <input class="code-input" id="room-code-input" maxlength="6" placeholder="房间号">
+                                    <button class="btn btn-ghost" id="copy-room-btn" type="button">复制房号</button>
+                                </div>
+
+                                <div class="status-line" id="online-status"></div>
+
+                                <div class="hidden" id="room-panel">
+                                    <div style="height: 18px"></div>
+                                    <div class="room-code">
+                                        <span>房间</span>
+                                        <strong id="room-code-text">------</strong>
+                                        <span id="room-role-text"></span>
+                                    </div>
+
+                                    <div style="height: 18px"></div>
+
+                                    <div class="summary-grid">
+                                        <div class="summary-card">
+                                            <h3 class="summary-title">联机完成关卡</h3>
+                                            <p class="summary-copy" id="online-progress-count">0 关</p>
+                                        </div>
+                                        <div class="summary-card">
+                                            <h3 class="summary-title">当前状态</h3>
+                                            <p class="summary-copy" id="room-state-text">等待玩家进入</p>
+                                        </div>
+                                    </div>
+
+                                    <div style="height: 18px"></div>
+
+                                    <h3 class="panel-title">房间成员</h3>
+                                    <div class="player-list" id="player-list"></div>
+
+                                    <div style="height: 18px"></div>
+
+                                    <h3 class="panel-title">选角</h3>
+                                    <div class="role-grid" id="role-grid"></div>
+
+                                    <div style="height: 18px"></div>
+
+                                    <h3 class="panel-title">选关</h3>
+                                    <div class="level-list" id="level-list"></div>
+
+                                    <div style="height: 18px"></div>
+
+                                    <div class="action-grid">
+                                        <button class="btn btn-primary" id="start-online-btn" type="button">开始联机关卡</button>
+                                        <button class="btn btn-secondary" id="retry-online-btn" type="button">重新开始当前关卡</button>
+                                        <button class="btn btn-danger" id="reset-online-btn" type="button">重置联机进度</button>
+                                        <button class="btn btn-ghost" id="leave-room-btn" type="button">离开房间</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="panel">
+                            <h2 class="panel-title">说明</h2>
+                            <div class="summary-grid">
+                                <div class="summary-card">
+                                    <h3 class="summary-title">单人模式</h3>
+                                    <p class="summary-copy">沿用现在的关卡流程，支持手动清空本机进度。</p>
+                                </div>
+                                <div class="summary-card">
+                                    <h3 class="summary-title">联机模式</h3>
+                                    <p class="summary-copy">2 人进房后由房主选关，双方各选一个角色，角色不能重复。</p>
+                                </div>
+                                <div class="summary-card">
+                                    <h3 class="summary-title">联机存档</h3>
+                                    <p class="summary-copy">按房间号保存已完成关卡，可手动重置房间进度。</p>
+                                </div>
+                                <div class="summary-card">
+                                    <h3 class="summary-title">操作方式</h3>
+                                    <p class="summary-copy">联机时两边都只使用 `WASD`。每个玩家只会控制自己选中的角色。</p>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="js/network-lobby.js"></script>
+        
+        
+    </body>
+</html>
