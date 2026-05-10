@@ -277,6 +277,13 @@ body {
   margin-bottom: 14px;
 }
 
+.auth-copy {
+  margin: 8px 0 0;
+  color: rgba(255, 238, 196, 0.72);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .panel-title {
   margin: 0;
   color: rgba(255, 243, 206, 0.97);
@@ -290,6 +297,12 @@ body {
 
 .detail-heading .panel-title {
   margin-bottom: 5px;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
 }
 
 .field-label {
@@ -546,6 +559,17 @@ body {
   border-top: 1px solid rgba(255, 225, 165, 0.13);
 }
 
+.mode-tip {
+  margin: 0 0 14px;
+  border: 1px solid rgba(255, 225, 165, 0.12);
+  border-radius: 8px;
+  padding: 11px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  color: rgba(255, 238, 196, 0.72);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .room-panel {
   background:
     linear-gradient(145deg, rgba(36, 160, 219, 0.11), transparent 42%),
@@ -648,6 +672,65 @@ body {
   background: rgba(0, 0, 0, 0.22);
 }
 
+.confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  box-sizing: border-box;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(240, 106, 44, 0.18), transparent 24%),
+    radial-gradient(circle at 70% 75%, rgba(40, 168, 223, 0.18), transparent 24%),
+    rgba(8, 8, 8, 0.62);
+  backdrop-filter: blur(5px);
+}
+
+.confirm-dialog {
+  width: min(460px, 100%);
+  border: 1px solid rgba(255, 225, 165, 0.22);
+  border-radius: 12px;
+  padding: 22px 22px 18px;
+  box-sizing: border-box;
+  background:
+    linear-gradient(145deg, rgba(239, 91, 43, 0.14), transparent 40%),
+    linear-gradient(320deg, rgba(40, 168, 223, 0.16), transparent 45%),
+    rgba(28, 22, 15, 0.96);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.confirm-kicker {
+  color: #ffca78;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.confirm-title {
+  margin: 10px 0 10px;
+  color: #fff4cf;
+  font-size: 26px;
+  line-height: 1.15;
+  text-shadow: 0 3px 0 rgba(0, 0, 0, 0.25);
+}
+
+.confirm-message {
+  margin: 0;
+  color: rgba(255, 238, 196, 0.78);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.confirm-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 20px;
+}
+
 .hidden {
   display: none !important;
 }
@@ -695,6 +778,7 @@ body {
   }
 
   .rule-strip,
+  .field-grid,
   .mode-grid,
   .action-grid,
   .action-stack,
@@ -702,6 +786,10 @@ body {
   .role-grid,
   .summary-grid,
   .info-dock {
+    grid-template-columns: 1fr;
+  }
+
+  .confirm-actions {
     grid-template-columns: 1fr;
   }
 }

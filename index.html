@@ -89,15 +89,21 @@
                             <div class="panel-heading">
                                 <span class="section-kicker">Account</span>
                                 <h2 class="panel-title">账号登录 / 注册</h2>
+                                <p class="auth-copy">首次使用先注册。登录成功后会自动保持登录状态，关闭页面后下次可直接进入大厅。</p>
                             </div>
 
-                            <label class="field-label" for="username-input">账号</label>
-                            <input class="text-input" id="username-input" maxlength="8" placeholder="abc123">
-                            <p class="field-hint">4-8 位，只能使用英文字母和数字。</p>
-
-                            <label class="field-label" for="password-input">密码</label>
-                            <input class="text-input" id="password-input" type="password" maxlength="32" placeholder="输入密码">
-                            <p class="field-hint">至少 6 位。</p>
+                            <div class="field-grid">
+                                <div>
+                                    <label class="field-label" for="username-input">账号</label>
+                                    <input class="text-input" id="username-input" maxlength="8" placeholder="abc123">
+                                    <p class="field-hint">4-8 位，只能使用英文字母和数字。</p>
+                                </div>
+                                <div>
+                                    <label class="field-label" for="password-input">密码</label>
+                                    <input class="text-input" id="password-input" type="password" maxlength="32" placeholder="输入密码">
+                                    <p class="field-hint">至少 6 位。密码不会在页面中回显保存。</p>
+                                </div>
+                            </div>
 
                             <div class="action-grid auth-actions">
                                 <button class="btn btn-primary" id="register-btn" type="button">注册账号</button>
@@ -128,8 +134,9 @@
                                 <div class="mode-detail hidden" id="single-panel">
                                     <div class="detail-heading">
                                         <h2 class="panel-title">单人模式</h2>
-                                        <p class="summary-copy">进入原版单人流程，当前账号可手动重置关卡进度。</p>
+                                        <p class="summary-copy">进入原版单人流程。适合自己闯关，进度跟随当前账号保存。</p>
                                     </div>
+                                    <div class="mode-tip">“一键通关”与“重置账号进度”都会直接修改当前账号的单机进度。</div>
                                     <div class="action-grid">
                                         <button class="btn btn-primary" id="single-start-btn" type="button">进入单人模式</button>
                                         <button class="btn btn-danger" id="single-reset-btn" type="button">重置账号进度</button>
@@ -141,8 +148,9 @@
                                 <div class="mode-detail hidden" id="online-panel">
                                     <div class="detail-heading">
                                         <h2 class="panel-title">联机大厅</h2>
-                                        <p class="summary-copy">创建房间后会切到等待界面；加入房间请输入 6 位房间号。</p>
+                                        <p class="summary-copy">创建房间后切到等待界面。加入房间时输入 6 位房间号，双方各自用 WASD 控制自己的角色。</p>
                                     </div>
+                                    <div class="mode-tip">联机进度按房主账号保存，房主负责原版选关和开始关卡。</div>
 
                                     <div class="action-stack">
                                         <button class="btn btn-primary" id="create-room-btn" type="button">创建房间</button>
@@ -198,6 +206,7 @@
 
                                 <div class="action-grid room-actions">
                                     <button class="btn btn-primary" id="start-online-btn" type="button">进入原版选关</button>
+                                    <button class="btn btn-secondary" id="reselect-online-btn" type="button">重新选关</button>
                                     <button class="btn btn-secondary" id="retry-online-btn" type="button">重新开始当前关卡</button>
                                     <button class="btn btn-danger" id="reset-online-btn" type="button">重置联机进度</button>
                                     <button class="btn btn-secondary" id="complete-online-btn" type="button">联机一键通关</button>
@@ -220,6 +229,18 @@
                                 <p class="summary-copy">双方只用 WASD 控制自己的角色。</p>
                             </div>
                         </section>
+                    </div>
+                </div>
+            </div>
+
+            <div class="confirm-overlay hidden" id="confirm-overlay" aria-hidden="true">
+                <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+                    <div class="confirm-kicker">确认操作</div>
+                    <h2 class="confirm-title" id="confirm-title">继续执行？</h2>
+                    <p class="confirm-message" id="confirm-message">这个操作会立刻生效。</p>
+                    <div class="confirm-actions">
+                        <button class="btn btn-ghost" id="confirm-cancel-btn" type="button">取消</button>
+                        <button class="btn btn-primary" id="confirm-ok-btn" type="button">确定</button>
                     </div>
                 </div>
             </div>

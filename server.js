@@ -176,10 +176,36 @@ function createSession(username) {
 function getSessionFromRequest(request) {
   const auth = request.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (!token) {
+  if (token) {
+    return sessions.get(token) || null;
+  }
+  const cookieHeader = request.headers.cookie || "";
+  const cookies = cookieHeader.split(";").reduce((map, chunk) => {
+    const [rawKey, ...rest] = chunk.split("=");
+    const key = String(rawKey || "").trim();
+    if (!key) {
+      return map;
+    }
+    map[key] = decodeURIComponent(rest.join("=").trim());
+    return map;
+  }, {});
+  const cookieToken = cookies.fb5_session || "";
+  if (!cookieToken) {
     return null;
   }
-  return sessions.get(token) || null;
+  return sessions.get(cookieToken) || null;
+}
+
+function setSessionCookie(response, token) {
+  response.setHeader("Set-Cookie", [
+    `fb5_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`,
+  ]);
+}
+
+function clearSessionCookie(response) {
+  response.setHeader("Set-Cookie", [
+    "fb5_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+  ]);
 }
 
 function createRoom(code, hostUsername) {
@@ -349,6 +375,7 @@ function detachClientFromRoom(client, reason = "left") {
       nonce: null,
       startedAt: null,
       startedAtMs: null,
+      snapshotSeq: 0,
     };
     broadcastRoom(room, {
       type: "return_to_room",
@@ -654,6 +681,7 @@ function handleMessage(client, message) {
       const token = String(message.token || "");
       const session = sessions.get(token);
       if (!session) {
+        client.user = null;
         fail(client, "Login expired. Please log in again.");
         return;
       }
@@ -964,6 +992,7 @@ async function handleRegister(request, response) {
     saveAccountsStore();
 
     const token = createSession(username);
+    setSessionCookie(response, token);
     writeJson(response, 200, {
       ok: true,
       token,
@@ -989,6 +1018,7 @@ async function handleLogin(request, response) {
     }
 
     const token = createSession(user.username);
+    setSessionCookie(response, token);
     writeJson(response, 200, {
       ok: true,
       token,
@@ -1004,12 +1034,14 @@ async function handleLogin(request, response) {
 function handleMe(request, response) {
   const session = getSessionFromRequest(request);
   if (!session) {
+    clearSessionCookie(response);
     writeJson(response, 401, { ok: false, message: "Not logged in." });
     return;
   }
 
   const user = getUserRecord(session.username);
   if (!user) {
+    clearSessionCookie(response);
     writeJson(response, 401, { ok: false, message: "Account does not exist." });
     return;
   }
@@ -1020,6 +1052,11 @@ function handleMe(request, response) {
     progressSingle: cloneProgress(user.progress_single),
     progressOnlineHost: cloneProgress(user.progress_online_host),
   });
+}
+
+function handleLogout(request, response) {
+  clearSessionCookie(response);
+  writeJson(response, 200, { ok: true });
 }
 
 async function handleProgressSave(request, response) {
@@ -1149,6 +1186,11 @@ const server = http.createServer((request, response) => {
 
   if (request.method === "GET" && request.url === "/api/auth/me") {
     handleMe(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/api/logout") {
+    handleLogout(request, response);
     return;
   }
 

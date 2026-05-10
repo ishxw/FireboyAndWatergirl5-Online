@@ -50,6 +50,7 @@
       idToBody: new Map(),
     },
     originals: {},
+    confirmResolver: null,
   };
 
   function qs(id) {
@@ -88,11 +89,17 @@
     playerList: qs("player-list"),
     roleGrid: qs("role-grid"),
     startOnlineBtn: qs("start-online-btn"),
+    reselectOnlineBtn: qs("reselect-online-btn"),
     retryOnlineBtn: qs("retry-online-btn"),
     resetOnlineBtn: qs("reset-online-btn"),
     completeOnlineBtn: qs("complete-online-btn"),
     leaveRoomBtn: qs("leave-room-btn"),
     floatingRoomBack: qs("floating-room-back"),
+    confirmOverlay: qs("confirm-overlay"),
+    confirmTitle: qs("confirm-title"),
+    confirmMessage: qs("confirm-message"),
+    confirmCancelBtn: qs("confirm-cancel-btn"),
+    confirmOkBtn: qs("confirm-ok-btn"),
   };
 
   function cloneJson(value) {
@@ -104,6 +111,44 @@
       return;
     }
     game.__pendingTempleSelectionTemple = null;
+  }
+
+  function closeConfirmDialog(confirmed) {
+    if (elements.confirmOverlay) {
+      elements.confirmOverlay.classList.add("hidden");
+      elements.confirmOverlay.setAttribute("aria-hidden", "true");
+    }
+    if (elements.confirmOkBtn) {
+      elements.confirmOkBtn.classList.remove("btn-danger");
+      elements.confirmOkBtn.classList.add("btn-primary");
+      elements.confirmOkBtn.textContent = "确定";
+    }
+    const resolver = app.confirmResolver;
+    app.confirmResolver = null;
+    if (resolver) {
+      resolver(!!confirmed);
+    }
+  }
+
+  function confirmAction(title, message, options) {
+    if (!elements.confirmOverlay || !elements.confirmTitle || !elements.confirmMessage) {
+      return Promise.resolve(window.confirm(message || title || "确定继续吗？"));
+    }
+    if (app.confirmResolver) {
+      closeConfirmDialog(false);
+    }
+    elements.confirmTitle.textContent = title || "继续执行？";
+    elements.confirmMessage.textContent = message || "这个操作会立即生效。";
+    if (elements.confirmOkBtn) {
+      elements.confirmOkBtn.textContent = options?.confirmLabel || "确定";
+      elements.confirmOkBtn.classList.toggle("btn-danger", options?.danger === true);
+      elements.confirmOkBtn.classList.toggle("btn-primary", options?.danger !== true);
+    }
+    elements.confirmOverlay.classList.remove("hidden");
+    elements.confirmOverlay.setAttribute("aria-hidden", "false");
+    return new Promise(function (resolve) {
+      app.confirmResolver = resolve;
+    });
   }
 
   function queueOnlineLevelStart(room) {
@@ -139,7 +184,7 @@
       headers.Authorization = `Bearer ${app.auth.token}`;
     }
 
-    return fetch(path, Object.assign({}, options || {}, { headers })).then(async function (response) {
+    return fetch(path, Object.assign({}, options || {}, { headers, credentials: "same-origin" })).then(async function (response) {
       const payload = await response.json().catch(function () {
         return {};
       });
@@ -200,6 +245,21 @@
     elements.mainPanel.classList.toggle("hidden", !loggedIn);
     elements.roomView.classList.toggle("hidden", !app.currentRoom);
     elements.authUserText.textContent = loggedIn ? `当前账号：${app.auth.user.username}` : "未登录";
+    if (elements.usernameInput) {
+      elements.usernameInput.disabled = loggedIn;
+    }
+    if (elements.passwordInput) {
+      elements.passwordInput.disabled = loggedIn;
+      if (loggedIn) {
+        elements.passwordInput.value = "";
+      }
+    }
+    if (elements.registerBtn) {
+      elements.registerBtn.disabled = loggedIn;
+    }
+    if (elements.loginBtn) {
+      elements.loginBtn.disabled = loggedIn;
+    }
   }
 
   function renderModeOptions() {
@@ -305,6 +365,9 @@
 
     elements.startOnlineBtn.textContent = room.selectedTempleId ? "开始联机关卡" : "进入原版选关";
     elements.startOnlineBtn.disabled = !isHost || (!!room.selectedTempleId && !readyToStart);
+    if (elements.reselectOnlineBtn) {
+      elements.reselectOnlineBtn.disabled = !isHost || !room.selectedTempleId;
+    }
     
     // Hide the retry button in the room as requested
     if (elements.retryOnlineBtn) {
@@ -691,6 +754,7 @@
       }
       emitInput();
     });
+
   }
 
   function emitInput() {
@@ -811,6 +875,7 @@
       } catch (error) {}
     }
     clearPendingTempleSelection(game);
+    game.paused = false;
 
     const option = findLevelOption(room.selectedTempleId, room.selectedLevelId);
     if (!option) {
@@ -890,6 +955,7 @@
         level.killAll = function () {};
         originalKillAll.call(level);
       }
+      game.paused = false;
       if (game.level === level) {
         game.level = null;
       }
@@ -1894,6 +1960,24 @@
     renderModePanels();
     renderAuthState();
 
+    if (elements.confirmCancelBtn) {
+      elements.confirmCancelBtn.addEventListener("click", function () {
+        closeConfirmDialog(false);
+      });
+    }
+    if (elements.confirmOkBtn) {
+      elements.confirmOkBtn.addEventListener("click", function () {
+        closeConfirmDialog(true);
+      });
+    }
+    if (elements.confirmOverlay) {
+      elements.confirmOverlay.addEventListener("click", function (event) {
+        if (event.target === elements.confirmOverlay) {
+          closeConfirmDialog(false);
+        }
+      });
+    }
+
     elements.registerBtn.addEventListener("click", async function () {
       try {
         const result = await request("/api/register", {
@@ -1926,10 +2010,14 @@
       }
     });
 
-    elements.logoutBtn.addEventListener("click", function () {
+    elements.logoutBtn.addEventListener("click", async function () {
+      try {
+        await request("/api/logout", { method: "POST", body: JSON.stringify({}) });
+      } catch (error) {}
       clearAuth();
       app.currentRoom = null;
       renderRoomState();
+      setStatus(elements.authStatus, "已退出登录。", "success");
     });
 
     elements.singleStartBtn.addEventListener("click", function () {
@@ -1937,6 +2025,14 @@
     });
 
     elements.singleResetBtn.addEventListener("click", async function () {
+      const confirmed = await confirmAction(
+        "重置单机进度？",
+        "这会立即清空当前账号的单机进度，所有单机关卡都会恢复到未完成状态。",
+        { danger: true, confirmLabel: "确认重置" },
+      );
+      if (!confirmed) {
+        return;
+      }
       try {
         await request("/api/progress/reset?mode=single", { method: "POST", body: JSON.stringify({}) });
         app.auth.progressSingle = null;
@@ -1949,6 +2045,14 @@
 
     if (elements.singleCompleteBtn) {
       elements.singleCompleteBtn.addEventListener("click", async function () {
+        const confirmed = await confirmAction(
+          "单机一键通关？",
+          "这会将当前账号的单机进度直接设为全部通关状态。",
+          { confirmLabel: "确认通关" },
+        );
+        if (!confirmed) {
+          return;
+        }
         try {
           const result = await request("/api/progress/complete-all?mode=single", { method: "POST", body: JSON.stringify({}) });
           app.auth.progressSingle = result.progress || null;
@@ -2008,11 +2112,29 @@
       startSelectedOnlineLevel();
     });
 
+    if (elements.reselectOnlineBtn) {
+      elements.reselectOnlineBtn.addEventListener("click", function () {
+        if (app.currentRoom?.hostId !== app.clientId) {
+          setStatus(elements.onlineStatus, "等待房主操作。", "success");
+          return;
+        }
+        beginOriginalPicker();
+      });
+    }
+
     elements.retryOnlineBtn.addEventListener("click", function () {
       sendWs({ type: "retry_level" });
     });
 
     elements.resetOnlineBtn.addEventListener("click", async function () {
+      const confirmed = await confirmAction(
+        "重置联机进度？",
+        "这会立即清空当前账号的联机房主进度，所有联机关卡完成记录都会恢复为未完成。",
+        { danger: true, confirmLabel: "确认重置" },
+      );
+      if (!confirmed) {
+        return;
+      }
       try {
         await request("/api/progress/reset?mode=online_host", { method: "POST", body: JSON.stringify({}) });
         app.auth.progressOnlineHost = null;
@@ -2030,6 +2152,14 @@
 
     if (elements.completeOnlineBtn) {
       elements.completeOnlineBtn.addEventListener("click", async function () {
+        const confirmed = await confirmAction(
+          "联机一键通关？",
+          "这会将当前账号的联机房主进度直接设为全部通关状态。",
+          { confirmLabel: "确认通关" },
+        );
+        if (!confirmed) {
+          return;
+        }
         try {
           const result = await request("/api/progress/complete-all?mode=online_host", { method: "POST", body: JSON.stringify({}) });
           app.auth.progressOnlineHost = result.progress || null;
