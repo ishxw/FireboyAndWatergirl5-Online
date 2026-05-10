@@ -53,117 +53,171 @@
             <div id="debug-fps" style="color:#ff0000; position: absolute; top: 0;"></div>
         </div>
 
+        <button id="floating-room-back" class="floating-room-back hidden" type="button">返回房间</button>
+
         <div id="lobby-root" class="visible">
             <div class="lobby-shell">
                 <div class="lobby-card">
-                    <h1 class="lobby-title">Fireboy &amp; Watergirl</h1>
-                    <p class="lobby-subtitle">
-                        选择单人或联机模式。联机模式支持房间选关、双人选角、房间进度保存与手动重置；单人模式保留当前玩法，并支持手动重置本地关卡进度。
-                    </p>
+                    <header class="lobby-header">
+                        <div class="brand-block">
+                            <img class="game-logo" src="assets/images/GameNameElements.png" alt="Fireboy &amp; Watergirl Elements">
+                            <div class="edition-line">Online Room Edition</div>
+                        </div>
+                        <div class="header-badges" aria-label="联机状态说明">
+                            <span class="header-badge fire">账号进度</span>
+                            <span class="header-badge water">WASD 双人</span>
+                        </div>
+                    </header>
 
-                    <div class="lobby-grid">
-                        <section class="panel">
-                            <h2 class="panel-title">模式选择</h2>
-                            <div class="mode-grid" id="mode-grid"></div>
-
-                            <div class="hidden" id="single-panel">
-                                <h2 class="panel-title">单人模式</h2>
-                                <div class="action-grid">
-                                    <button class="btn btn-primary" id="single-start-btn" type="button">进入单人模式</button>
-                                    <button class="btn btn-danger" id="single-reset-btn" type="button">重置单人进度</button>
-                                </div>
-                                <div class="status-line" id="single-status"></div>
+                    <div class="auth-layout" id="auth-panel">
+                        <section class="intro-panel">
+                            <div class="intro-copy">
+                                <span class="eyebrow">元素神殿入口</span>
+                                <h1 class="lobby-title">选择模式，邀请伙伴，然后进门。</h1>
+                                <p class="lobby-subtitle">
+                                    登录后可进入单人或联机模式。联机房主使用原版选关流程选关，双方都在各自页面用 WASD 控制自己选择的角色。
+                                </p>
                             </div>
-
-                            <div class="hidden" id="online-panel">
-                                <h2 class="panel-title">联机房间</h2>
-
-                                <label class="field-label" for="player-name-input">玩家昵称</label>
-                                <input class="text-input" id="player-name-input" maxlength="16" placeholder="输入你的昵称">
-
-                                <div style="height: 12px"></div>
-
-                                <div class="action-grid">
-                                    <button class="btn btn-primary" id="create-room-btn" type="button">创建房间</button>
-                                    <button class="btn btn-secondary" id="join-room-btn" type="button">加入房间</button>
-                                </div>
-
-                                <div style="height: 12px"></div>
-
-                                <div class="room-grid">
-                                    <input class="code-input" id="room-code-input" maxlength="6" placeholder="房间号">
-                                    <button class="btn btn-ghost" id="copy-room-btn" type="button">复制房号</button>
-                                </div>
-
-                                <div class="status-line" id="online-status"></div>
-
-                                <div class="hidden" id="room-panel">
-                                    <div style="height: 18px"></div>
-                                    <div class="room-code">
-                                        <span>房间</span>
-                                        <strong id="room-code-text">------</strong>
-                                        <span id="room-role-text"></span>
-                                    </div>
-
-                                    <div style="height: 18px"></div>
-
-                                    <div class="summary-grid">
-                                        <div class="summary-card">
-                                            <h3 class="summary-title">联机完成关卡</h3>
-                                            <p class="summary-copy" id="online-progress-count">0 关</p>
-                                        </div>
-                                        <div class="summary-card">
-                                            <h3 class="summary-title">当前状态</h3>
-                                            <p class="summary-copy" id="room-state-text">等待玩家进入</p>
-                                        </div>
-                                    </div>
-
-                                    <div style="height: 18px"></div>
-
-                                    <h3 class="panel-title">房间成员</h3>
-                                    <div class="player-list" id="player-list"></div>
-
-                                    <div style="height: 18px"></div>
-
-                                    <h3 class="panel-title">选角</h3>
-                                    <div class="role-grid" id="role-grid"></div>
-
-                                    <div style="height: 18px"></div>
-
-                                    <h3 class="panel-title">选关</h3>
-                                    <div class="level-list" id="level-list"></div>
-
-                                    <div style="height: 18px"></div>
-
-                                    <div class="action-grid">
-                                        <button class="btn btn-primary" id="start-online-btn" type="button">开始联机关卡</button>
-                                        <button class="btn btn-secondary" id="retry-online-btn" type="button">重新开始当前关卡</button>
-                                        <button class="btn btn-danger" id="reset-online-btn" type="button">重置联机进度</button>
-                                        <button class="btn btn-ghost" id="leave-room-btn" type="button">离开房间</button>
-                                    </div>
-                                </div>
+                            <div class="rule-strip">
+                                <span>账号 4-8 位英文数字</span>
+                                <span>密码至少 6 位</span>
+                                <span>进度按账号保存</span>
                             </div>
                         </section>
 
-                        <section class="panel">
-                            <h2 class="panel-title">说明</h2>
-                            <div class="summary-grid">
-                                <div class="summary-card">
-                                    <h3 class="summary-title">单人模式</h3>
-                                    <p class="summary-copy">沿用现在的关卡流程，支持手动清空本机进度。</p>
+                        <section class="panel auth-card">
+                            <div class="panel-heading">
+                                <span class="section-kicker">Account</span>
+                                <h2 class="panel-title">账号登录 / 注册</h2>
+                            </div>
+
+                            <label class="field-label" for="username-input">账号</label>
+                            <input class="text-input" id="username-input" maxlength="8" placeholder="abc123">
+                            <p class="field-hint">4-8 位，只能使用英文字母和数字。</p>
+
+                            <label class="field-label" for="password-input">密码</label>
+                            <input class="text-input" id="password-input" type="password" maxlength="32" placeholder="输入密码">
+                            <p class="field-hint">至少 6 位。</p>
+
+                            <div class="action-grid auth-actions">
+                                <button class="btn btn-primary" id="register-btn" type="button">注册账号</button>
+                                <button class="btn btn-secondary" id="login-btn" type="button">登录账号</button>
+                            </div>
+
+                            <div class="status-line" id="auth-status"></div>
+                        </section>
+                    </div>
+
+                    <div id="main-panel" class="hidden">
+                        <section class="account-strip">
+                            <div>
+                                <span class="section-kicker">Signed In</span>
+                                <p class="account-name" id="auth-user-text">未登录</p>
+                            </div>
+                            <button class="btn btn-ghost compact-btn" id="logout-btn" type="button">退出登录</button>
+                        </section>
+
+                        <div class="lobby-grid">
+                            <section class="panel mode-panel">
+                                <div class="panel-heading">
+                                    <span class="section-kicker">Mode</span>
+                                    <h2 class="panel-title">模式选择</h2>
                                 </div>
-                                <div class="summary-card">
-                                    <h3 class="summary-title">联机模式</h3>
-                                    <p class="summary-copy">2 人进房后由房主选关，双方各选一个角色，角色不能重复。</p>
+                                <div class="mode-grid" id="mode-grid"></div>
+
+                                <div class="mode-detail hidden" id="single-panel">
+                                    <div class="detail-heading">
+                                        <h2 class="panel-title">单人模式</h2>
+                                        <p class="summary-copy">进入原版单人流程，当前账号可手动重置关卡进度。</p>
+                                    </div>
+                                    <div class="action-grid">
+                                        <button class="btn btn-primary" id="single-start-btn" type="button">进入单人模式</button>
+                                        <button class="btn btn-danger" id="single-reset-btn" type="button">重置账号进度</button>
+                                        <button class="btn btn-secondary" id="single-complete-btn" type="button">一键通关</button>
+                                    </div>
+                                    <div class="status-line" id="single-status"></div>
                                 </div>
-                                <div class="summary-card">
-                                    <h3 class="summary-title">联机存档</h3>
-                                    <p class="summary-copy">按房间号保存已完成关卡，可手动重置房间进度。</p>
+
+                                <div class="mode-detail hidden" id="online-panel">
+                                    <div class="detail-heading">
+                                        <h2 class="panel-title">联机大厅</h2>
+                                        <p class="summary-copy">创建房间后会切到等待界面；加入房间请输入 6 位房间号。</p>
+                                    </div>
+
+                                    <div class="action-stack">
+                                        <button class="btn btn-primary" id="create-room-btn" type="button">创建房间</button>
+                                        <div class="room-grid">
+                                            <input class="code-input" id="room-code-input" maxlength="6" placeholder="房间号">
+                                            <button class="btn btn-secondary" id="join-room-btn" type="button">加入房间</button>
+                                        </div>
+                                    </div>
+
+                                    <div class="status-line" id="online-status"></div>
                                 </div>
-                                <div class="summary-card">
-                                    <h3 class="summary-title">操作方式</h3>
-                                    <p class="summary-copy">联机时两边都只使用 `WASD`。每个玩家只会控制自己选中的角色。</p>
+                            </section>
+
+                            <section class="panel room-panel hidden" id="room-view">
+                                <div class="room-topline">
+                                    <div class="panel-heading">
+                                        <span class="section-kicker">Room</span>
+                                        <h2 class="panel-title">房间等待</h2>
+                                    </div>
+                                    <div class="room-code">
+                                        <span>房间</span>
+                                        <strong id="room-code-text">------</strong>
+                                        <button class="btn btn-secondary btn-copy-code" id="copy-room-btn" type="button">复制</button>
+                                    </div>
                                 </div>
+                                <p class="room-role" id="room-role-text"></p>
+
+                                <div class="summary-grid room-summary">
+                                    <div class="summary-card">
+                                        <h3 class="summary-title">当前状态</h3>
+                                        <p class="summary-copy" id="room-state-text">未进入房间</p>
+                                    </div>
+                                    <div class="summary-card">
+                                        <h3 class="summary-title">关卡进度</h3>
+                                        <p class="summary-copy" id="room-progress-text">未读取</p>
+                                    </div>
+                                </div>
+
+                                <div class="waiting-panel">
+                                    <span class="section-kicker">Hint</span>
+                                    <p id="waiting-hint-text">创建或加入一个房间后，进入等待界面。</p>
+                                </div>
+
+                                <div class="room-section">
+                                    <h3 class="panel-title">房间成员</h3>
+                                    <div class="player-list" id="player-list"></div>
+                                </div>
+
+                                <div class="room-section">
+                                    <h3 class="panel-title">选角</h3>
+                                    <div class="role-grid" id="role-grid"></div>
+                                </div>
+
+                                <div class="action-grid room-actions">
+                                    <button class="btn btn-primary" id="start-online-btn" type="button">进入原版选关</button>
+                                    <button class="btn btn-secondary" id="retry-online-btn" type="button">重新开始当前关卡</button>
+                                    <button class="btn btn-danger" id="reset-online-btn" type="button">重置联机进度</button>
+                                    <button class="btn btn-secondary" id="complete-online-btn" type="button">联机一键通关</button>
+                                    <button class="btn btn-ghost" id="leave-room-btn" type="button">离开房间</button>
+                                </div>
+                            </section>
+                        </div>
+
+                        <section class="info-dock" aria-label="玩法说明">
+                            <div class="summary-card">
+                                <h3 class="summary-title">原版选关</h3>
+                                <p class="summary-copy">房主进入原版选关，保留解锁限制。</p>
+                            </div>
+                            <div class="summary-card">
+                                <h3 class="summary-title">独立等待</h3>
+                                <p class="summary-copy">创建房间后直接进入等待界面。</p>
+                            </div>
+                            <div class="summary-card">
+                                <h3 class="summary-title">双人操作</h3>
+                                <p class="summary-copy">双方只用 WASD 控制自己的角色。</p>
                             </div>
                         </section>
                     </div>

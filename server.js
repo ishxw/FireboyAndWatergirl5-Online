@@ -7,12 +7,13 @@ const ROOT = __dirname;
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 8005);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : ROOT;
-const PROGRESS_FILE = path.resolve(process.env.PROGRESS_FILE || path.join(DATA_DIR, "online-progress.json"));
+const ACCOUNTS_FILE = path.resolve(process.env.ACCOUNTS_FILE || path.join(DATA_DIR, "accounts.json"));
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_MESSAGE_BYTES = Number(process.env.MAX_MESSAGE_BYTES || 1024 * 1024);
 const CLIENT_PING_INTERVAL_MS = Number(process.env.CLIENT_PING_INTERVAL_MS || 25000);
 const ROOM_IDLE_TTL_MS = Number(process.env.ROOM_IDLE_TTL_MS || 6 * 60 * 60 * 1000);
 const ROOM_CLEANUP_INTERVAL_MS = Number(process.env.ROOM_CLEANUP_INTERVAL_MS || 60 * 1000);
+const ACCOUNT_REGEX = /^[A-Za-z0-9]{4,8}$/;
 
 const MIME_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -38,22 +39,6 @@ function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function createEmptyProgress() {
-  return {
-    completedLevels: [],
-    history: [],
-    updatedAt: null,
-  };
-}
-
-function loadProgressStore() {
-  try {
-    return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
-  } catch (error) {
-    return {};
-  }
-}
-
 function atomicWriteJson(filePath, value) {
   ensureDirectory(path.dirname(filePath));
   const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
@@ -61,32 +46,162 @@ function atomicWriteJson(filePath, value) {
   fs.renameSync(tempFile, filePath);
 }
 
-let progressStore = loadProgressStore();
-const rooms = new Map();
-const clients = new Map();
-
-function saveProgressStore() {
-  atomicWriteJson(PROGRESS_FILE, progressStore);
+function readJsonFile(filePath) {
+  const raw = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+  return JSON.parse(raw);
 }
 
-function cloneProgress(code) {
-  const progress = progressStore[code] || createEmptyProgress();
+function createEmptyProgress() {
   return {
-    completedLevels: [...(progress.completedLevels || [])],
-    history: [...(progress.history || [])],
+    completedLevels: [],
+    updatedAt: null,
+  };
+}
+
+function createEmptyAccountsStore() {
+  return {
+    users: {},
+  };
+}
+
+function normaliseLegacyProgress(progress) {
+  if (!progress) {
+    return createEmptyProgress();
+  }
+  return {
+    completedLevels: Array.isArray(progress.completedLevels) ? [...progress.completedLevels] : [],
     updatedAt: progress.updatedAt || null,
   };
 }
 
-function ensureProgress(code) {
-  if (!progressStore[code]) {
-    progressStore[code] = createEmptyProgress();
+function ensureUserProgressShape(userRecord) {
+  if (!userRecord.progress_single) {
+    userRecord.progress_single = normaliseLegacyProgress(userRecord.progress);
+  } else {
+    userRecord.progress_single = normaliseLegacyProgress(userRecord.progress_single);
   }
-  return progressStore[code];
+
+  if (!userRecord.progress_online_host) {
+    userRecord.progress_online_host = createEmptyProgress();
+  } else {
+    userRecord.progress_online_host = normaliseLegacyProgress(userRecord.progress_online_host);
+  }
+
+  delete userRecord.progress;
 }
 
-function randomId(length = 12) {
+function loadAccountsStore() {
+  try {
+    const store = readJsonFile(ACCOUNTS_FILE);
+    Object.values(store.users || {}).forEach(ensureUserProgressShape);
+    return store;
+  } catch (error) {
+    return createEmptyAccountsStore();
+  }
+}
+
+let accountsStore = loadAccountsStore();
+const sessions = new Map();
+const rooms = new Map();
+const clients = new Map();
+
+function saveAccountsStore() {
+  atomicWriteJson(ACCOUNTS_FILE, accountsStore);
+}
+
+function randomId(length = 16) {
   return crypto.randomBytes(length).toString("hex");
+}
+
+function normaliseUsername(username) {
+  return String(username || "").trim();
+}
+
+function usernameKey(username) {
+  return normaliseUsername(username).toLowerCase();
+}
+
+function validateCredentials(username, password) {
+  const cleanUsername = normaliseUsername(username);
+  const cleanPassword = String(password || "");
+
+  if (!ACCOUNT_REGEX.test(cleanUsername)) {
+    return "Username must be 4-8 letters or digits.";
+  }
+  if (cleanPassword.length < 6) {
+    return "Password must be at least 6 characters.";
+  }
+  return null;
+}
+
+function hashPassword(password, salt) {
+  const passwordSalt = salt || crypto.randomBytes(16).toString("hex");
+  const passwordHash = crypto.scryptSync(password, passwordSalt, 64).toString("hex");
+  return {
+    salt: passwordSalt,
+    hash: passwordHash,
+  };
+}
+
+function verifyPassword(password, userRecord) {
+  const expected = Buffer.from(userRecord.passwordHash, "hex");
+  const actual = Buffer.from(hashPassword(password, userRecord.passwordSalt).hash, "hex");
+  if (expected.length !== actual.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(expected, actual);
+}
+
+function cloneProgress(progress) {
+  return progress == null ? null : JSON.parse(JSON.stringify(progress));
+}
+
+function getUserRecord(username) {
+  const user = accountsStore.users[usernameKey(username)] || null;
+  if (user) {
+    ensureUserProgressShape(user);
+  }
+  return user;
+}
+
+function createSession(username) {
+  const token = randomId(24);
+  sessions.set(token, {
+    username,
+    createdAt: Date.now(),
+  });
+  return token;
+}
+
+function getSessionFromRequest(request) {
+  const auth = request.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!token) {
+    return null;
+  }
+  return sessions.get(token) || null;
+}
+
+function createRoom(code, hostUsername) {
+  return {
+    code,
+    hostId: null,
+    hostUsername,
+    players: new Map(),
+    selectedTempleId: null,
+    selectedLevelId: null,
+    game: {
+      status: "lobby",
+      nonce: null,
+      startedAt: null,
+      startedAtMs: null,
+    },
+    updatedAt: Date.now(),
+  };
+}
+
+function touchRoom(room) {
+  room.updatedAt = Date.now();
 }
 
 function generateRoomCode() {
@@ -100,17 +215,7 @@ function generateRoomCode() {
       return code;
     }
   }
-
   throw new Error("Unable to allocate room code");
-}
-
-function sanitiseName(value) {
-  const base = String(value || "").trim().slice(0, 16);
-  if (base) {
-    return base;
-  }
-
-  return `Player-${Math.floor(Math.random() * 9000 + 1000)}`;
 }
 
 function normaliseRoomCode(value) {
@@ -121,46 +226,21 @@ function normaliseRoomCode(value) {
     .slice(0, 6);
 }
 
-function touchRoom(room) {
-  room.updatedAt = Date.now();
-}
-
-function createRoom(code) {
-  return {
-    code,
-    hostId: null,
-    players: new Map(),
-    selectedTempleId: null,
-    selectedLevelId: null,
-    game: {
-      status: "lobby",
-      nonce: null,
-      startedAt: null,
-    },
-    progress: cloneProgress(code),
-    updatedAt: Date.now(),
-  };
-}
-
-function getOrCreateRoom(code) {
-  const roomCode = normaliseRoomCode(code);
-  if (!rooms.has(roomCode)) {
-    rooms.set(roomCode, createRoom(roomCode));
-  }
-  const room = rooms.get(roomCode);
-  touchRoom(room);
-  return room;
+function getOnlineHostProgress(room) {
+  const host = room?.hostUsername ? getUserRecord(room.hostUsername) : null;
+  return cloneProgress(host?.progress_online_host || createEmptyProgress());
 }
 
 function serialiseRoom(room) {
   return {
     code: room.code,
     hostId: room.hostId,
+    hostUsername: room.hostUsername,
     selectedTempleId: room.selectedTempleId,
     selectedLevelId: room.selectedLevelId,
     players: [...room.players.values()].map((player) => ({
       id: player.id,
-      name: player.name,
+      username: player.username,
       role: player.role || null,
       joinedAt: player.joinedAt,
     })),
@@ -169,11 +249,7 @@ function serialiseRoom(room) {
       nonce: room.game.nonce,
       startedAt: room.game.startedAt,
     },
-    progress: {
-      completedLevels: [...room.progress.completedLevels],
-      history: [...room.progress.history],
-      updatedAt: room.progress.updatedAt,
-    },
+    progressOnlineHost: getOnlineHostProgress(room),
   };
 }
 
@@ -217,7 +293,6 @@ function sendMessage(client, message) {
 function broadcastRoom(room, message, options = {}) {
   const skipClientId = options.skipClientId || null;
   touchRoom(room);
-
   for (const player of room.players.values()) {
     if (player.id === skipClientId) {
       continue;
@@ -261,6 +336,7 @@ function detachClientFromRoom(client, reason = "left") {
 
   if (room.hostId === client.id) {
     room.hostId = room.players.size > 0 ? [...room.players.keys()][0] : null;
+    room.hostUsername = room.hostId ? room.players.get(room.hostId)?.username || room.hostUsername : room.hostUsername;
   }
 
   if (removeRoomIfEmpty(room)) {
@@ -272,6 +348,7 @@ function detachClientFromRoom(client, reason = "left") {
       status: "lobby",
       nonce: null,
       startedAt: null,
+      startedAtMs: null,
     };
     broadcastRoom(room, {
       type: "return_to_room",
@@ -282,26 +359,33 @@ function detachClientFromRoom(client, reason = "left") {
   emitRoomState(room);
 }
 
-function joinRoom(client, code, name) {
+function joinRoom(client, code) {
+  if (!client.user) {
+    fail(client, "Please log in first.");
+    return;
+  }
+
   const roomCode = normaliseRoomCode(code);
   if (!roomCode) {
-    fail(client, "Invalid room code.");
+    fail(client, "Please enter a valid room code.");
     return;
   }
 
   detachClientFromRoom(client, "switch_room");
 
-  const room = getOrCreateRoom(roomCode);
-
+  const room = rooms.get(roomCode);
+  if (!room) {
+    fail(client, "房间不存在");
+    return;
+  }
   if (room.players.size >= 2 && !room.players.has(client.id)) {
-    fail(client, "Room is full. Only 2 players are allowed.");
+    fail(client, "Room is full.");
     return;
   }
 
-  room.progress = cloneProgress(room.code);
   room.players.set(client.id, {
     id: client.id,
-    name: sanitiseName(name),
+    username: client.user.username,
     role: null,
     joinedAt: nowIso(),
     client,
@@ -310,42 +394,32 @@ function joinRoom(client, code, name) {
 
   if (!room.hostId || !room.players.has(room.hostId)) {
     room.hostId = client.id;
+    room.hostUsername = client.user.username;
   }
 
   emitRoomState(room);
 }
 
-function updateRoomProgress(room, entry) {
-  const key = `${entry.templeId}:${entry.levelId}`;
-  const progress = ensureProgress(room.code);
-
-  if (!progress.completedLevels.includes(key)) {
-    progress.completedLevels.push(key);
+function updateHostOnlineProgress(room, updater) {
+  const host = room?.hostUsername ? getUserRecord(room.hostUsername) : null;
+  if (!host) {
+    return null;
   }
 
-  progress.history.push({
-    key,
-    success: entry.success !== false,
-    finishedAt: nowIso(),
-  });
-  progress.updatedAt = nowIso();
-  room.progress = cloneProgress(room.code);
-  touchRoom(room);
-  saveProgressStore();
-}
-
-function resetRoomProgress(room) {
-  progressStore[room.code] = createEmptyProgress();
-  room.progress = cloneProgress(room.code);
-  touchRoom(room);
-  saveProgressStore();
+  ensureUserProgressShape(host);
+  const next = cloneProgress(host.progress_online_host) || createEmptyProgress();
+  updater(next);
+  next.updatedAt = nowIso();
+  host.progress_online_host = next;
+  host.updatedAt = nowIso();
+  saveAccountsStore();
+  return next;
 }
 
 function handleRoomMessage(client, message) {
   const room = findPlayerRoom(client);
-
   if (!room) {
-    fail(client, "Join a room first.");
+    fail(client, "Join or create a room first.");
     return;
   }
 
@@ -370,19 +444,14 @@ function handleRoomMessage(client, message) {
         status: "lobby",
         nonce: null,
         startedAt: null,
+        startedAtMs: null,
       };
-
-      for (const roomPlayer of room.players.values()) {
-        roomPlayer.role = null;
-      }
-
       emitRoomState(room);
       return;
     }
 
     case "select_role": {
       const nextRole = message.role == null ? null : String(message.role);
-
       if (nextRole !== null && nextRole !== "fb" && nextRole !== "wg") {
         fail(client, "Invalid role.");
         return;
@@ -407,12 +476,10 @@ function handleRoomMessage(client, message) {
         fail(client, "Only the host can start the level.");
         return;
       }
-
       if (room.players.size !== 2) {
         fail(client, "Online mode requires 2 players.");
         return;
       }
-
       if (!room.selectedTempleId || !room.selectedLevelId) {
         fail(client, "Choose a level first.");
         return;
@@ -428,30 +495,24 @@ function handleRoomMessage(client, message) {
         status: "playing",
         nonce: randomId(8),
         startedAt: nowIso(),
+        startedAtMs: Date.now(),
       };
-
       emitRoomState(room);
       broadcastRoom(room, {
         type: "start_level",
         room: serialiseRoom(room),
+        elapsedMs: 0,
       });
       return;
     }
 
-    case "reset_room_progress": {
+    case "retry_level": {
       if (client.id !== room.hostId) {
-        fail(client, "Only the host can reset online progress.");
+        fail(client, "Only the host can retry.");
         return;
       }
-
-      resetRoomProgress(room);
-      emitRoomState(room);
-      return;
-    }
-
-    case "retry_level": {
       if (!room.selectedTempleId || !room.selectedLevelId) {
-        fail(client, "There is no selected level to retry.");
+        fail(client, "No level selected.");
         return;
       }
 
@@ -459,12 +520,13 @@ function handleRoomMessage(client, message) {
         status: "playing",
         nonce: randomId(8),
         startedAt: nowIso(),
+        startedAtMs: Date.now(),
       };
-
       emitRoomState(room);
       broadcastRoom(room, {
         type: "start_level",
         room: serialiseRoom(room),
+        elapsedMs: 0,
       });
       return;
     }
@@ -474,8 +536,10 @@ function handleRoomMessage(client, message) {
         status: "lobby",
         nonce: null,
         startedAt: null,
+        startedAtMs: null,
       };
-
+      room.selectedTempleId = null;
+      room.selectedLevelId = null;
       emitRoomState(room);
       broadcastRoom(room, {
         type: "return_to_room",
@@ -484,27 +548,43 @@ function handleRoomMessage(client, message) {
       return;
     }
 
+    case "continue_levels": {
+      if (client.id !== room.hostId) {
+        fail(client, "Only the host can continue level selection.");
+        return;
+      }
+
+      room.game = {
+        status: "lobby",
+        nonce: null,
+        startedAt: null,
+        startedAtMs: null,
+      };
+      room.selectedLevelId = null;
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "return_to_room",
+        reason: "continue_levels",
+      }, { skipClientId: room.hostId });
+      return;
+    }
+
     case "input": {
       if (room.game.status !== "playing" || room.game.nonce !== message.nonce) {
         return;
       }
-
-      broadcastRoom(
-        room,
-        {
-          type: "player_input",
-          clientId: client.id,
-          role: player.role,
-          nonce: message.nonce,
-          seq: Number(message.seq || 0),
-          state: {
-            left: !!message.state?.left,
-            right: !!message.state?.right,
-            up: !!message.state?.up,
-          },
+      broadcastRoom(room, {
+        type: "player_input",
+        clientId: client.id,
+        role: player.role,
+        nonce: message.nonce,
+        seq: Number(message.seq || 0),
+        state: {
+          left: !!message.state?.left,
+          right: !!message.state?.right,
+          up: !!message.state?.up,
         },
-        { skipClientId: client.id },
-      );
+      }, { skipClientId: client.id });
       return;
     }
 
@@ -512,40 +592,39 @@ function handleRoomMessage(client, message) {
       if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
         return;
       }
-
-      broadcastRoom(
-        room,
-        {
-          type: "level_snapshot",
-          nonce: message.nonce,
-          clock: Number(message.clock || 0),
-          bodies: Array.isArray(message.bodies) ? message.bodies : [],
-        },
-        { skipClientId: client.id },
-      );
+      broadcastRoom(room, {
+        type: "level_snapshot",
+        nonce: message.nonce,
+        elapsedMs: Math.max(0, Date.now() - (room.game.startedAtMs || Date.now())),
+        bodies: Array.isArray(message.bodies) ? message.bodies : [],
+        players: message.players || null,
+      });
       return;
     }
 
-    case "complete_level": {
+    case "complete_level":
+    case "level_complete": {
       if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
         return;
       }
 
-      updateRoomProgress(room, {
-        templeId: room.selectedTempleId,
-        levelId: room.selectedLevelId,
-        success: true,
+      updateHostOnlineProgress(room, (progress) => {
+        const key = `${room.selectedTempleId}:${room.selectedLevelId}`;
+        if (!progress.completedLevels.includes(key)) {
+          progress.completedLevels.push(key);
+        }
       });
-      room.game.status = "ended";
 
+      room.game.status = "ended";
       emitRoomState(room);
+      broadcastRoom(room, {
+        type: "online_finish_animation",
+        nonce: message.nonce,
+      }, { skipClientId: room.hostId });
       broadcastRoom(room, {
         type: "level_complete",
         nonce: message.nonce,
-        summary: {
-          state: message.summary?.state || null,
-          totalDiamonds: message.summary?.totalDiamonds || 0,
-        },
+        payload: message.payload || null,
       });
       return;
     }
@@ -554,15 +633,12 @@ function handleRoomMessage(client, message) {
       if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
         return;
       }
-
       room.game.status = "ended";
       emitRoomState(room);
       broadcastRoom(room, {
         type: "level_failed",
         nonce: message.nonce,
-        summary: {
-          state: message.summary?.state || null,
-        },
+        payload: message.payload || null,
       });
       return;
     }
@@ -574,14 +650,44 @@ function handleRoomMessage(client, message) {
 
 function handleMessage(client, message) {
   switch (message.type) {
+    case "authenticate": {
+      const token = String(message.token || "");
+      const session = sessions.get(token);
+      if (!session) {
+        fail(client, "Login expired. Please log in again.");
+        return;
+      }
+      const user = getUserRecord(session.username);
+      if (!user) {
+        fail(client, "Account does not exist.");
+        return;
+      }
+      client.user = {
+        username: user.username,
+      };
+      sendMessage(client, {
+        type: "authenticated",
+        user: {
+          username: user.username,
+        },
+      });
+      return;
+    }
+
     case "create_room": {
+      if (!client.user) {
+        fail(client, "Please log in first.");
+        return;
+      }
       const code = generateRoomCode();
-      joinRoom(client, code, message.name);
+      const room = createRoom(code, client.user.username);
+      rooms.set(code, room);
+      joinRoom(client, code);
       return;
     }
 
     case "join_room": {
-      joinRoom(client, message.roomCode, message.name);
+      joinRoom(client, message.roomCode);
       return;
     }
 
@@ -652,14 +758,13 @@ function decodeFrame(buffer) {
   };
 }
 
-function createWebSocketClient(socket, request) {
+function createWebSocketClient(socket) {
   return {
     id: randomId(6),
     socket,
-    request,
     buffer: Buffer.alloc(0),
     roomCode: null,
-    connectedAt: nowIso(),
+    user: null,
     lastSeenAt: Date.now(),
     lastPongAt: Date.now(),
     isAlive: true,
@@ -707,18 +812,15 @@ function handleSocketData(client, chunk) {
       destroyClient(client, "close_frame");
       return;
     }
-
     if (frame.opcode === 0x9) {
       sendFrame(client.socket, frame.payload, 0x0a);
       continue;
     }
-
     if (frame.opcode === 0x0a) {
       client.isAlive = true;
       client.lastPongAt = Date.now();
       continue;
     }
-
     if (frame.opcode !== 0x1) {
       continue;
     }
@@ -732,16 +834,32 @@ function handleSocketData(client, chunk) {
   }
 }
 
-function getSafePath(urlPath) {
-  const decodedPath = decodeURIComponent((urlPath || "/").split("?")[0] || "/");
-  const relativePath = decodedPath === "/" ? "/index.html" : decodedPath;
-  const resolvedPath = path.resolve(path.join(ROOT, `.${relativePath}`));
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
 
-  if (!resolvedPath.startsWith(ROOT)) {
-    return null;
-  }
+    request.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > MAX_MESSAGE_BYTES) {
+        reject(new Error("Request body too large."));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
 
-  return resolvedPath;
+    request.on("end", () => {
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8") || "{}";
+        resolve(JSON.parse(raw));
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    request.on("error", reject);
+  });
 }
 
 function writeJson(response, statusCode, payload) {
@@ -750,6 +868,16 @@ function writeJson(response, statusCode, payload) {
     "Cache-Control": "no-store",
   });
   response.end(JSON.stringify(payload));
+}
+
+function getSafePath(urlPath) {
+  const decodedPath = decodeURIComponent((urlPath || "/").split("?")[0] || "/");
+  const relativePath = decodedPath === "/" ? "/index.html" : decodedPath;
+  const resolvedPath = path.resolve(path.join(ROOT, `.${relativePath}`));
+  if (!resolvedPath.startsWith(ROOT)) {
+    return null;
+  }
+  return resolvedPath;
 }
 
 function serveStaticFile(request, response) {
@@ -768,9 +896,10 @@ function serveStaticFile(request, response) {
     }
 
     const extension = path.extname(safePath).toLowerCase();
+    const noStoreExtensions = new Set([".html", ".js", ".css"]);
     response.writeHead(200, {
       "Content-Type": MIME_TYPES[extension] || "application/octet-stream",
-      "Cache-Control": extension === ".html" ? "no-store" : "public, max-age=3600",
+      "Cache-Control": noStoreExtensions.has(extension) ? "no-store" : "public, max-age=3600",
     });
 
     fs.createReadStream(safePath).pipe(response);
@@ -787,26 +916,211 @@ function cleanupIdleRooms() {
 }
 
 function pingClients() {
-  const pingPayload = Buffer.from(String(Date.now()));
-
+  const payload = Buffer.from(String(Date.now()));
   for (const client of clients.values()) {
     if (client.socket.destroyed) {
       destroyClient(client, "socket_destroyed");
       continue;
     }
-
     if (!client.isAlive && Date.now() - client.lastPongAt > CLIENT_PING_INTERVAL_MS * 2) {
       destroyClient(client, "ping_timeout");
       continue;
     }
-
     client.isAlive = false;
     try {
-      sendFrame(client.socket, pingPayload, 0x9);
+      sendFrame(client.socket, payload, 0x9);
     } catch (error) {
       destroyClient(client, "ping_failed");
     }
   }
+}
+
+async function handleRegister(request, response) {
+  try {
+    const body = await readJsonBody(request);
+    const username = normaliseUsername(body.username);
+    const password = String(body.password || "");
+    const error = validateCredentials(username, password);
+
+    if (error) {
+      writeJson(response, 400, { ok: false, message: error });
+      return;
+    }
+    if (getUserRecord(username)) {
+      writeJson(response, 400, { ok: false, message: "Account already exists." });
+      return;
+    }
+
+    const passwordState = hashPassword(password);
+    accountsStore.users[usernameKey(username)] = {
+      username,
+      passwordSalt: passwordState.salt,
+      passwordHash: passwordState.hash,
+      progress_single: createEmptyProgress(),
+      progress_online_host: createEmptyProgress(),
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    saveAccountsStore();
+
+    const token = createSession(username);
+    writeJson(response, 200, {
+      ok: true,
+      token,
+      user: { username },
+      progressSingle: createEmptyProgress(),
+      progressOnlineHost: createEmptyProgress(),
+    });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Invalid register request." });
+  }
+}
+
+async function handleLogin(request, response) {
+  try {
+    const body = await readJsonBody(request);
+    const username = normaliseUsername(body.username);
+    const password = String(body.password || "");
+    const user = getUserRecord(username);
+
+    if (!user || !verifyPassword(password, user)) {
+      writeJson(response, 401, { ok: false, message: "Invalid username or password." });
+      return;
+    }
+
+    const token = createSession(user.username);
+    writeJson(response, 200, {
+      ok: true,
+      token,
+      user: { username: user.username },
+      progressSingle: cloneProgress(user.progress_single),
+      progressOnlineHost: cloneProgress(user.progress_online_host),
+    });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Invalid login request." });
+  }
+}
+
+function handleMe(request, response) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    writeJson(response, 401, { ok: false, message: "Not logged in." });
+    return;
+  }
+
+  const user = getUserRecord(session.username);
+  if (!user) {
+    writeJson(response, 401, { ok: false, message: "Account does not exist." });
+    return;
+  }
+
+  writeJson(response, 200, {
+    ok: true,
+    user: { username: user.username },
+    progressSingle: cloneProgress(user.progress_single),
+    progressOnlineHost: cloneProgress(user.progress_online_host),
+  });
+}
+
+async function handleProgressSave(request, response) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    writeJson(response, 401, { ok: false, message: "Not logged in." });
+    return;
+  }
+
+  const user = getUserRecord(session.username);
+  if (!user) {
+    writeJson(response, 401, { ok: false, message: "Account does not exist." });
+    return;
+  }
+
+  try {
+    const body = await readJsonBody(request);
+    const mode = String(body.mode || "single");
+    if (mode === "online_host") {
+      user.progress_online_host = cloneProgress(body.progress || createEmptyProgress());
+    } else {
+      user.progress_single = cloneProgress(body.progress || createEmptyProgress());
+    }
+    user.updatedAt = nowIso();
+    saveAccountsStore();
+    writeJson(response, 200, { ok: true });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Progress save failed." });
+  }
+}
+
+function getModeFromUrl(url) {
+  return String((url.split("?")[1] || "").includes("mode=online_host") ? "online_host" : "single");
+}
+
+function handleProgressReset(request, response) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    writeJson(response, 401, { ok: false, message: "Not logged in." });
+    return;
+  }
+
+  const user = getUserRecord(session.username);
+  if (!user) {
+    writeJson(response, 401, { ok: false, message: "Account does not exist." });
+    return;
+  }
+
+  const mode = getModeFromUrl(request.url);
+  if (mode === "online_host") {
+    user.progress_online_host = createEmptyProgress();
+  } else {
+    user.progress_single = createEmptyProgress();
+  }
+  user.updatedAt = nowIso();
+  saveAccountsStore();
+  writeJson(response, 200, { ok: true });
+}
+
+function collectAllLevelIds() {
+  const gameConfig = readJsonFile(path.join(ROOT, "game.json"));
+  const templePaths = Array.isArray(gameConfig.temples) ? gameConfig.temples : [];
+  const completedLevels = [];
+
+  templePaths.forEach((templePath) => {
+    const temple = readJsonFile(path.join(ROOT, "data", templePath, "temple.json"));
+    (temple.levels || []).forEach((level) => {
+      completedLevels.push(`${temple.id}:${level.id}`);
+    });
+  });
+
+  return completedLevels;
+}
+
+function handleProgressCompleteAll(request, response) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    writeJson(response, 401, { ok: false, message: "Not logged in." });
+    return;
+  }
+
+  const user = getUserRecord(session.username);
+  if (!user) {
+    writeJson(response, 401, { ok: false, message: "Account does not exist." });
+    return;
+  }
+
+  const mode = getModeFromUrl(request.url);
+  const nextProgress = {
+    completedLevels: collectAllLevelIds(),
+    updatedAt: nowIso(),
+  };
+
+  if (mode === "online_host") {
+    user.progress_online_host = nextProgress;
+  } else {
+    user.progress_single = nextProgress;
+  }
+  user.updatedAt = nowIso();
+  saveAccountsStore();
+  writeJson(response, 200, { ok: true, progress: nextProgress });
 }
 
 const server = http.createServer((request, response) => {
@@ -816,9 +1130,40 @@ const server = http.createServer((request, response) => {
       uptimeSeconds: Math.round(process.uptime()),
       activeRooms: rooms.size,
       activeClients: clients.size,
-      progressFile: PROGRESS_FILE,
+      accounts: Object.keys(accountsStore.users).length,
+      accountsFile: ACCOUNTS_FILE,
       timestamp: nowIso(),
     });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/api/register") {
+    handleRegister(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/api/login") {
+    handleLogin(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/api/auth/me") {
+    handleMe(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url.startsWith("/api/progress/save")) {
+    handleProgressSave(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url.startsWith("/api/progress/reset")) {
+    handleProgressReset(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url.startsWith("/api/progress/complete-all")) {
+    handleProgressCompleteAll(request, response);
     return;
   }
 
@@ -855,7 +1200,7 @@ server.on("upgrade", (request, socket) => {
     ].join("\r\n"),
   );
 
-  const client = createWebSocketClient(socket, request);
+  const client = createWebSocketClient(socket);
   clients.set(client.id, client);
   sendMessage(client, {
     type: "welcome",
@@ -868,10 +1213,10 @@ server.on("upgrade", (request, socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  ensureDirectory(path.dirname(PROGRESS_FILE));
+  ensureDirectory(path.dirname(ACCOUNTS_FILE));
   console.log(`[server] listening on http://127.0.0.1:${PORT}/index.html`);
   console.log(`[server] health check on http://127.0.0.1:${PORT}/healthz`);
-  console.log(`[server] progress file: ${PROGRESS_FILE}`);
+  console.log(`[server] accounts file: ${ACCOUNTS_FILE}`);
 });
 
 setInterval(cleanupIdleRooms, ROOM_CLEANUP_INTERVAL_MS).unref();
