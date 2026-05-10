@@ -43,6 +43,7 @@
     pendingWsAction: null,
     pendingStartRoom: null,
     pendingStartAttempts: 0,
+    levelMenuReadyAt: 0,
     snapshotTimer: 0,
     remoteOutcomePending: null,
     syncMaps: {
@@ -111,6 +112,36 @@
       return;
     }
     game.__pendingTempleSelectionTemple = null;
+  }
+
+  function armLevelMenuDelayGuard() {
+    app.levelMenuReadyAt = Date.now() + 1000;
+  }
+
+  function isLevelMenuDelayReady() {
+    return Date.now() >= Number(app.levelMenuReadyAt || 0);
+  }
+
+  function armMenuDelayGuard() {
+    app.menuReadyAt = Date.now() + 1000;
+  }
+
+  function isMenuDelayReady() {
+    return Date.now() >= Number(app.menuReadyAt || 0);
+  }
+
+  function resetTransitionState(game) {
+    if (!game?.state) {
+      return;
+    }
+    game.paused = false;
+    game.state.fading = false;
+    if (game.state.overlay?.kill) {
+      try {
+        game.state.overlay.kill();
+      } catch (error) {}
+    }
+    game.state.overlay = null;
   }
 
   function closeConfirmDialog(confirmed) {
@@ -785,6 +816,8 @@
     game.__onlineMode = false;
     game.__onlinePickingLevel = true;
     game.__singlePlayerLobbyMode = false;
+    armMenuDelayGuard();
+    armLevelMenuDelayGuard();
     clearPendingTempleSelection(game);
     applyAccountProgressToGame(game);
     
@@ -803,6 +836,7 @@
     game.__onlineMode = false;
     game.__onlinePickingLevel = false;
     game.__singlePlayerLobbyMode = true;
+    armMenuDelayGuard();
     
     restoreLocalProgress(game);
     applyAccountProgressToGame(game);
@@ -845,7 +879,9 @@
     }
     game.__onlineMode = false;
     game.__onlinePickingLevel = true;
+    game.__onlineLevelSelectReady = false;
     game.__singlePlayerLobbyMode = false;
+    armMenuDelayGuard();
     app.currentNonce = null;
     app.serverElapsedMs = 0;
     app.localInputState = { left: false, right: false, up: false };
@@ -962,13 +998,44 @@
     } catch (error) {}
   }
 
+  function stopResidualLevelAudio(game) {
+    if (game?.sound?.stopAll) {
+      try {
+        game.sound.stopAll();
+      } catch (error) {}
+    }
+    const level = game?.level;
+    if (level?.sounds) {
+      Object.keys(level.sounds).forEach(function (soundKey) {
+        const sound = level.sounds[soundKey];
+        if (sound?.stop) {
+          try {
+            sound.stop();
+          } catch (error) {}
+        }
+      });
+    }
+    const levelState = game?.state?.states?.level;
+    if (levelState?.sounds) {
+      Object.keys(levelState.sounds).forEach(function (soundKey) {
+        const sound = levelState.sounds[soundKey];
+        if (sound?.stop) {
+          try {
+            sound.stop();
+          } catch (error) {}
+        }
+      });
+    }
+  }
+
   function forceBackToRoom() {
     const game = getGame();
     if (!game) {
       return;
     }
-    if (game.level) {
-      game.level.ended = true;
+    const previousLevel = game.level || null;
+    if (previousLevel) {
+      teardownCurrentOnlineLevel(game, previousLevel);
     }
     game.__onlineMode = false;
     game.__onlinePickingLevel = false;
@@ -979,6 +1046,7 @@
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
+    stopResidualLevelAudio(game);
     restoreLocalProgress(game);
     showLobby();
     
@@ -1008,7 +1076,9 @@
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
+    stopResidualLevelAudio(game);
     restoreLocalProgress(game);
+    resetTransitionState(game);
     game.paused = false;
     if (game.state?.current !== "menu") {
       game.state.start("menu", true, false);
@@ -1393,6 +1463,7 @@
     const originalLevelMenuLayoutContent = LevelMenuClass.prototype.layoutContent;
     const originalStartLevel = LevelMenuClass.prototype.startLevel;
     const originalGoBack = LevelMenuClass.prototype.goBack;
+    const originalTempleClicked = game.require("States/Menu/TempleSelector").prototype.templeClicked;
     const originalEndCreate = EndState.prototype.create;
     const originalGameOverRenderContent = GameOverMenu.prototype.renderContent;
     const originalEndMenuContinue = EndMenu.prototype.gotoMenu;
@@ -1634,8 +1705,34 @@
       }
     };
 
+    MenuClass.prototype.startTemple = function (templeData) {
+      if (!isMenuDelayReady()) {
+        return;
+      }
+      return originalStartTemple.call(this, templeData);
+    };
+
+    const TempleSelectorClass = game.require("States/Menu/TempleSelector");
+    TempleSelectorClass.prototype.templeClicked = function () {
+      if (!isMenuDelayReady()) {
+        this.didpan = false;
+        return;
+      }
+      armMenuDelayGuard();
+      return originalTempleClicked.apply(this, arguments);
+    };
+
     LevelMenuClass.prototype.afterAddContent = function () {
       originalLevelMenuAfterAddContent.call(this);
+      armLevelMenuDelayGuard();
+      if (this.game.__onlinePickingLevel) {
+        this.game.__onlineLevelSelectReady = false;
+        setTimeout(() => {
+          if (this.game.state?.current === "levelMenu" && this.game.__onlinePickingLevel) {
+            this.game.__onlineLevelSelectReady = true;
+          }
+        }, 1000);
+      }
       removeRoomBackButton(this);
     };
 
@@ -1646,8 +1743,15 @@
     };
 
     LevelMenuClass.prototype.startLevel = function (button) {
+      if (!isLevelMenuDelayReady()) {
+        return;
+      }
       if (this.game.__onlinePickingLevel) {
+        if (this.game.state?.fading || this.game.__onlineLevelSelectReady !== true) {
+          return;
+        }
         this.game.__onlinePickingLevel = false;
+        this.game.__onlineLevelSelectReady = false;
         clearPendingTempleSelection(this.game);
         sendWs({
           type: "select_level",
