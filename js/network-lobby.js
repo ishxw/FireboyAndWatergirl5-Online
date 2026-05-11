@@ -36,6 +36,7 @@
     currentNonce: null,
     isHostRuntime: false,
     serverElapsedMs: 0,
+    authoritativeElapsedMs: 0,
     levelOptions: [],
     dataLoaded: false,
     localProgressBackup: null,
@@ -158,6 +159,203 @@
     app.confirmResolver = null;
     if (resolver) {
       resolver(!!confirmed);
+    }
+  }
+
+  function resetOnlineSyncRuntime() {
+    app.onlineInputSeq = 0;
+    app.__inputHistory = [];
+    app.__snapshotBuffer = [];
+    app.__lastAckSeqs = { fb: 0, wg: 0 };
+    app.__lastSyncState = new Map();
+    app.authoritativeElapsedMs = 0;
+  }
+
+  function writeNonceToBytes(target, offset, nonce) {
+    const value = String(nonce || "").padEnd(16, " ").slice(0, 16);
+    for (let i = 0; i < 16; i += 1) {
+      target[offset + i] = value.charCodeAt(i);
+    }
+  }
+
+  function readNonceFromBytes(data, offset) {
+    let nonce = "";
+    for (let i = 0; i < 16; i += 1) {
+      nonce += String.fromCharCode(data[offset + i]);
+    }
+    return nonce.trimEnd();
+  }
+
+  function isLocalPlayerBody(game, id) {
+    return (id.startsWith("player-fb") && game.__onlineSelectedRole === "fb") ||
+      (id.startsWith("player-wg") && game.__onlineSelectedRole === "wg");
+  }
+
+  function isRemotePlayerBody(game, id) {
+    return (id.startsWith("player-fb") || id.startsWith("player-wg")) && !isLocalPlayerBody(game, id);
+  }
+
+  function resolveSnapshotState(snapshotA, snapshotB, playbackTime, id) {
+    const stateA = snapshotA?.bodies?.get(id) || null;
+    const stateB = snapshotB?.bodies?.get(id) || null;
+
+    if (stateA && stateB && snapshotB.timestamp > snapshotA.timestamp) {
+      const t = Math.max(0, Math.min(1, (playbackTime - snapshotA.timestamp) / (snapshotB.timestamp - snapshotA.timestamp)));
+      return {
+        x: stateA.x + (stateB.x - stateA.x) * t,
+        y: stateA.y + (stateB.y - stateA.y) * t,
+        angle: stateA.angle + (stateB.angle - stateA.angle) * t,
+        vx: stateA.vx + (stateB.vx - stateA.vx) * t,
+        vy: stateA.vy + (stateB.vy - stateA.vy) * t,
+      };
+    }
+
+    if (stateA) {
+      const aheadMs = Math.max(0, playbackTime - snapshotA.timestamp);
+      const dt = Math.min(aheadMs / 1000, 0.12);
+      return {
+        x: stateA.x + stateA.vx * dt,
+        y: stateA.y + stateA.vy * dt,
+        angle: stateA.angle,
+        vx: stateA.vx,
+        vy: stateA.vy,
+      };
+    }
+
+    return null;
+  }
+
+  function updateRemotePlaybackInputFromState(targetState) {
+    if (!targetState) {
+      return;
+    }
+
+    const nextLeft = targetState.vx > 0.6;
+    const nextRight = targetState.vx < -0.6;
+    const now = Date.now();
+
+    if (targetState.vy > 3) {
+      app.__remoteJumpUntil = now + 120;
+    } else if (!app.__remoteJumpUntil) {
+      app.__remoteJumpUntil = 0;
+    }
+
+    app.remoteInputState.left = nextLeft;
+    app.remoteInputState.right = nextRight;
+    app.remoteInputState.up = now < Number(app.__remoteJumpUntil || 0);
+  }
+
+  function accumulateRemoteCorrection(body, dx, dy) {
+    if (!body) {
+      return;
+    }
+    if (!body.__netCorrection) {
+      body.__netCorrection = { x: 0, y: 0 };
+    }
+    body.__netCorrection.x += dx;
+    body.__netCorrection.y += dy;
+  }
+
+  function applyRemoteCorrection(body) {
+    const correction = body?.__netCorrection;
+    if (!body || !correction) {
+      return;
+    }
+
+    const dx = correction.x;
+    const dy = correction.y;
+    const distSq = dx * dx + dy * dy;
+    if (distSq < 0.000001) {
+      correction.x = 0;
+      correction.y = 0;
+      return;
+    }
+
+    const factor = distSq > 9 ? 0.22 : distSq > 1 ? 0.14 : 0.08;
+    const stepX = dx * factor;
+    const stepY = dy * factor;
+    const current = body.GetPosition();
+    body.SetPositionXY(current.x + stepX, current.y + stepY);
+    correction.x -= stepX;
+    correction.y -= stepY;
+
+    const angleCorrection = Number(body.__netAngleCorrection || 0);
+    if (Math.abs(angleCorrection) >= 0.00001) {
+      const angleStep = angleCorrection * (Math.abs(angleCorrection) > 0.2 ? 0.24 : 0.12);
+      body.SetAngle(body.GetAngleRadians() + angleStep);
+      body.__netAngleCorrection = angleCorrection - angleStep;
+    } else {
+      body.__netAngleCorrection = 0;
+    }
+  }
+
+  function normaliseAngleDelta(value) {
+    let delta = Number(value || 0);
+    while (delta > Math.PI) {
+      delta -= Math.PI * 2;
+    }
+    while (delta < -Math.PI) {
+      delta += Math.PI * 2;
+    }
+    return delta;
+  }
+
+  function clearBodyCorrections(body) {
+    if (!body) {
+      return;
+    }
+    if (!body.__netCorrection) {
+      body.__netCorrection = { x: 0, y: 0 };
+    } else {
+      body.__netCorrection.x = 0;
+      body.__netCorrection.y = 0;
+    }
+    body.__netAngleCorrection = 0;
+  }
+
+  function queueSnapshotCorrection(game, body, id, targetState) {
+    if (!body || !targetState) {
+      return;
+    }
+
+    const current = body.GetPosition();
+    const dx = targetState.x - current.x;
+    const dy = targetState.y - current.y;
+    const distSq = dx * dx + dy * dy;
+    const isLocal = isLocalPlayerBody(game, id);
+    const hardSnapSq = isLocal ? 4 : 2.25;
+    const angleDelta = normaliseAngleDelta(targetState.angle - body.GetAngleRadians());
+    const hardSnapAngle = isLocal ? 0.9 : 0.5;
+
+    body.__syncTarget = targetState;
+
+    if (targetState.isDying || distSq > hardSnapSq) {
+      body.SetPositionXY(targetState.x, targetState.y);
+      body.SetAngle(targetState.angle);
+      if (body.SetLinearVelocity) {
+        body.SetLinearVelocity(new box2d.b2Vec2(targetState.vx, targetState.vy));
+      }
+      if (body.SetAngularVelocity) {
+        body.SetAngularVelocity(targetState.av || 0);
+      }
+      clearBodyCorrections(body);
+      return;
+    }
+
+    accumulateRemoteCorrection(body, dx, dy);
+
+    if (Math.abs(angleDelta) > hardSnapAngle) {
+      body.SetAngle(targetState.angle);
+      body.__netAngleCorrection = 0;
+    } else {
+      body.__netAngleCorrection = Number(body.__netAngleCorrection || 0) + angleDelta;
+    }
+
+    if (!isLocal) {
+      body.SetLinearVelocity(new box2d.b2Vec2(targetState.vx, targetState.vy));
+      if (body.SetAngularVelocity) {
+        body.SetAngularVelocity(targetState.av || 0);
+      }
     }
   }
 
@@ -419,7 +617,11 @@
       setStatus(elements.onlineStatus, "房间连接尚未建立。", "error");
       return;
     }
-    app.ws.send(JSON.stringify(payload));
+    if (payload instanceof ArrayBuffer) {
+      app.ws.send(payload);
+    } else {
+      app.ws.send(JSON.stringify(payload));
+    }
   }
 
   function runAfterWsAuth(action) {
@@ -446,6 +648,7 @@
     }
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     app.ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    app.ws.binaryType = "arraybuffer";
 
     app.ws.addEventListener("open", function () {
       app.wsReady = true;
@@ -466,9 +669,42 @@
     });
 
     app.ws.addEventListener("message", function (event) {
+      if (event.data instanceof ArrayBuffer) {
+        handleBinaryMessage(new Uint8Array(event.data));
+        return;
+      }
+      if (ArrayBuffer.isView(event.data)) {
+        handleBinaryMessage(new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength));
+        return;
+      }
+      if (event.data instanceof Blob) {
+        const reader = new FileReader();
+        reader.onload = function () {
+          handleBinaryMessage(new Uint8Array(reader.result));
+        };
+        reader.readAsArrayBuffer(event.data);
+        return;
+      }
       const message = JSON.parse(event.data);
       handleWsMessage(message);
     });
+  }
+
+  function handleBinaryMessage(data) {
+    const type = data[0];
+    if (type === 0x01) { // Snapshot
+      decodeBinarySnapshot(data);
+    } else if (type === 0x02) { // Input
+      decodeBinaryInput(data);
+    }
+  }
+
+  function decodeBinaryInput(data) {
+    return;
+  }
+
+  function decodeBinarySnapshot(data) {
+    return;
   }
 
   function handleWsMessage(message) {
@@ -920,8 +1156,10 @@
       return;
     }
 
+    resetOnlineSyncRuntime();
     app.currentNonce = room.game?.nonce || null;
     app.serverElapsedMs = Number(room.elapsedMs || 0);
+    app.authoritativeElapsedMs = app.serverElapsedMs;
     app.selectedRole = room.players.find(function (player) {
       return player.id === app.clientId;
     })?.role || null;
@@ -1239,6 +1477,45 @@
     sendWs({ type: "start_level" });
   }
 
+  function resolveLevelSelection(button, templeData) {
+    const templeId = templeData?.id || null;
+    const optionTempleLevels = app.levelOptions.filter(function (option) {
+      return option.templeId === templeId;
+    });
+    const rawData = button?.data || null;
+
+    const directId = rawData?.id;
+    if (directId != null && directId !== "" && directId !== "undefined") {
+      return {
+        templeId,
+        levelId: String(directId),
+      };
+    }
+
+    const filename = rawData?.filename || button?.filename || null;
+    if (filename) {
+      const byFilename = optionTempleLevels.find(function (option) {
+        return String(option.levelData?.filename || "") === String(filename);
+      });
+      if (byFilename) {
+        return {
+          templeId,
+          levelId: String(byFilename.levelId),
+        };
+      }
+    }
+
+    const buttonIndex = templeData?.levels?.indexOf?.(rawData);
+    if (buttonIndex >= 0 && templeData?.levels?.[buttonIndex]) {
+      return {
+        templeId,
+        levelId: String(templeData.levels[buttonIndex].id),
+      };
+    }
+
+    return null;
+  }
+
   function handleOnlineContinue() {
     const game = getGame();
     if (!game?.__onlineMode) {
@@ -1311,6 +1588,10 @@
   }
 
   function sendSnapshot(level) {
+    if (!level || level.ended || !level.game || level.game.level !== level || !level.ui?.clock || !level.loadCompleted) {
+      return;
+    }
+
     const bodies = [];
     app.syncMaps.idToBody.forEach(function (body, id) {
       const position = body.GetPosition();
@@ -1345,13 +1626,10 @@
         : null,
     };
 
-    if (!level || level.ended || !level.game || level.game.level !== level || !level.ui?.clock || !level.loadCompleted) {
-      return;
-    }
     sendWs({
       type: "snapshot",
       nonce: app.currentNonce,
-      elapsedMs: (level.ui?.clock?.getElapsedSeconds ? level.ui.clock.getElapsedSeconds() : 0) * 1000,
+      elapsedMs: Math.max(0, Math.round(app.serverElapsedMs || 0)),
       bodies,
       players,
     });
@@ -1416,12 +1694,16 @@
       if (!body) {
         return;
       }
-      body.SetPositionXY(bodyState.x, bodyState.y);
-      body.SetAngle(bodyState.angle);
-      body.SetLinearVelocity(new box2d.b2Vec2(bodyState.vx, bodyState.vy));
-      if (body.SetAngularVelocity) {
-        body.SetAngularVelocity(bodyState.av || 0);
-      }
+      queueSnapshotCorrection(game, body, bodyState.id, {
+        x: bodyState.x,
+        y: bodyState.y,
+        vx: bodyState.vx,
+        vy: bodyState.vy,
+        angle: bodyState.angle,
+        av: bodyState.av || 0,
+        isDying: (bodyState.id === "player-fb" ? !!message.players?.fb?.dying :
+          bodyState.id === "player-wg" ? !!message.players?.wg?.dying : false),
+      });
     });
   }
 
@@ -1638,12 +1920,24 @@
       if (!this.game || !this.game.__onlineMode || !this.loadCompleted || this.ended) {
         return;
       }
+
+      app.syncMaps.idToBody.forEach(function (body) {
+        applyRemoteCorrection(body);
+      });
+
       if (app.isHostRuntime) {
         app.snapshotTimer += this.game.time.elapsed;
         if (app.snapshotTimer >= 80) {
           app.snapshotTimer = 0;
           sendSnapshot(this);
         }
+        return;
+      }
+
+      app.snapshotTimer += this.game.time.elapsed;
+      if (app.snapshotTimer >= 45) {
+        app.snapshotTimer = 0;
+        emitInput();
       }
     };
 
@@ -1706,9 +2000,6 @@
     };
 
     MenuClass.prototype.startTemple = function (templeData) {
-      if (!isMenuDelayReady()) {
-        return;
-      }
       return originalStartTemple.call(this, templeData);
     };
 
@@ -1753,10 +2044,17 @@
         this.game.__onlinePickingLevel = false;
         this.game.__onlineLevelSelectReady = false;
         clearPendingTempleSelection(this.game);
+        const selection = resolveLevelSelection(button, this.templeData);
+        if (!selection?.templeId || selection?.levelId == null) {
+          setStatus(elements.onlineStatus, "无法识别所选关卡。请重新选择。", "error");
+          this.game.__onlinePickingLevel = true;
+          this.game.__onlineLevelSelectReady = true;
+          return;
+        }
         sendWs({
           type: "select_level",
-          templeId: this.templeData.id,
-          levelId: String(button.data.id),
+          templeId: selection.templeId,
+          levelId: selection.levelId,
         });
         showLobby();
         this.game.state.fade("menu", true, false);
@@ -1888,6 +2186,9 @@
       }
       if (this.stopped) {
         return;
+      }
+      if (app.isHostRuntime) {
+        app.serverElapsedMs = Math.max(0, Number(app.serverElapsedMs || 0) + Number(this.game.time?.elapsed || 0));
       }
       const elapsedSeconds = Math.max(0, Math.round((app.serverElapsedMs || 0) / 1000));
       this.text.text = this.game.secondsToString(elapsedSeconds);
@@ -2299,6 +2600,7 @@
     loadTempleData();
     bootAuth();
     installKeyboardSync();
+    window.__fb5LobbyApp = app;
     waitForGame(function (game) {
       patchGame(game);
     });
