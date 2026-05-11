@@ -2,17 +2,30 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { WebSocketServer } = require("ws");
+
+const { createDatabase } = require("./lib/database");
+const {
+  createManifestResponse,
+  listAllLevelKeys,
+  loadGameManifest,
+  resolveLevelKey,
+} = require("./lib/game-manifest");
 
 const ROOT = __dirname;
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 8005);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : ROOT;
-const ACCOUNTS_FILE = path.resolve(process.env.ACCOUNTS_FILE || path.join(DATA_DIR, "accounts.json"));
-const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const DB_FILE = path.resolve(process.env.DB_FILE || path.join(DATA_DIR, "fireboy-online.sqlite"));
+const LEGACY_ACCOUNTS_FILE = path.resolve(
+  process.env.ACCOUNTS_FILE || path.join(ROOT, "accounts.json"),
+);
 const MAX_MESSAGE_BYTES = Number(process.env.MAX_MESSAGE_BYTES || 1024 * 1024);
 const CLIENT_PING_INTERVAL_MS = Number(process.env.CLIENT_PING_INTERVAL_MS || 25000);
 const ROOM_IDLE_TTL_MS = Number(process.env.ROOM_IDLE_TTL_MS || 6 * 60 * 60 * 1000);
 const ROOM_CLEANUP_INTERVAL_MS = Number(process.env.ROOM_CLEANUP_INTERVAL_MS || 60 * 1000);
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 24 * 60 * 60 * 1000);
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS || 60 * 1000);
 const ACCOUNT_REGEX = /^[A-Za-z0-9]{4,8}$/;
 
 const MIME_TYPES = {
@@ -39,86 +52,12 @@ function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function atomicWriteJson(filePath, value) {
-  ensureDirectory(path.dirname(filePath));
-  const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify(value, null, 2), "utf8");
-  fs.renameSync(tempFile, filePath);
-}
-
-function readJsonFile(filePath) {
-  const raw = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
-  return JSON.parse(raw);
-}
-
-function createEmptyProgress() {
-  return {
-    completedLevels: [],
-    updatedAt: null,
-  };
-}
-
-function createEmptyAccountsStore() {
-  return {
-    users: {},
-  };
-}
-
-function normaliseLegacyProgress(progress) {
-  if (!progress) {
-    return createEmptyProgress();
-  }
-  return {
-    completedLevels: Array.isArray(progress.completedLevels) ? [...progress.completedLevels] : [],
-    updatedAt: progress.updatedAt || null,
-  };
-}
-
-function ensureUserProgressShape(userRecord) {
-  if (!userRecord.progress_single) {
-    userRecord.progress_single = normaliseLegacyProgress(userRecord.progress);
-  } else {
-    userRecord.progress_single = normaliseLegacyProgress(userRecord.progress_single);
-  }
-
-  if (!userRecord.progress_online_host) {
-    userRecord.progress_online_host = createEmptyProgress();
-  } else {
-    userRecord.progress_online_host = normaliseLegacyProgress(userRecord.progress_online_host);
-  }
-
-  delete userRecord.progress;
-}
-
-function loadAccountsStore() {
-  try {
-    const store = readJsonFile(ACCOUNTS_FILE);
-    Object.values(store.users || {}).forEach(ensureUserProgressShape);
-    return store;
-  } catch (error) {
-    return createEmptyAccountsStore();
-  }
-}
-
-let accountsStore = loadAccountsStore();
-const sessions = new Map();
-const rooms = new Map();
-const clients = new Map();
-
-function saveAccountsStore() {
-  atomicWriteJson(ACCOUNTS_FILE, accountsStore);
-}
-
 function randomId(length = 16) {
   return crypto.randomBytes(length).toString("hex");
 }
 
 function normaliseUsername(username) {
   return String(username || "").trim();
-}
-
-function usernameKey(username) {
-  return normaliseUsername(username).toLowerCase();
 }
 
 function validateCredentials(username, password) {
@@ -144,61 +83,38 @@ function hashPassword(password, salt) {
 }
 
 function verifyPassword(password, userRecord) {
-  const expected = Buffer.from(userRecord.passwordHash, "hex");
-  const actual = Buffer.from(hashPassword(password, userRecord.passwordSalt).hash, "hex");
+  const expected = Buffer.from(userRecord.password_hash, "hex");
+  const actual = Buffer.from(hashPassword(password, userRecord.password_salt).hash, "hex");
   if (expected.length !== actual.length) {
     return false;
   }
   return crypto.timingSafeEqual(expected, actual);
 }
 
-function cloneProgress(progress) {
-  return progress == null ? null : JSON.parse(JSON.stringify(progress));
-}
-
-function getUserRecord(username) {
-  const user = accountsStore.users[usernameKey(username)] || null;
-  if (user) {
-    ensureUserProgressShape(user);
-  }
-  return user;
-}
-
-function createSession(username) {
-  const token = randomId(24);
-  sessions.set(token, {
-    username,
-    createdAt: Date.now(),
-  });
-  return token;
-}
-
-function getSessionFromRequest(request) {
-  const auth = request.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (token) {
-    return sessions.get(token) || null;
-  }
-  const cookieHeader = request.headers.cookie || "";
-  const cookies = cookieHeader.split(";").reduce((map, chunk) => {
-    const [rawKey, ...rest] = chunk.split("=");
-    const key = String(rawKey || "").trim();
-    if (!key) {
+function parseCookies(cookieHeader) {
+  return String(cookieHeader || "")
+    .split(";")
+    .reduce((map, chunk) => {
+      const [rawKey, ...rest] = chunk.split("=");
+      const key = String(rawKey || "").trim();
+      if (!key) {
+        return map;
+      }
+      map[key] = decodeURIComponent(rest.join("=").trim());
       return map;
-    }
-    map[key] = decodeURIComponent(rest.join("=").trim());
-    return map;
-  }, {});
-  const cookieToken = cookies.fb5_session || "";
-  if (!cookieToken) {
-    return null;
-  }
-  return sessions.get(cookieToken) || null;
+    }, {});
+}
+
+function parseQueryValue(urlString, key) {
+  const url = new URL(urlString, "http://localhost");
+  return url.searchParams.get(key);
 }
 
 function setSessionCookie(response, token) {
   response.setHeader("Set-Cookie", [
-    `fb5_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`,
+    `fb5_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(
+      SESSION_TTL_MS / 1000,
+    )}`,
   ]);
 }
 
@@ -208,658 +124,12 @@ function clearSessionCookie(response) {
   ]);
 }
 
-function createRoom(code, hostUsername) {
-  return {
-    code,
-    hostId: null,
-    hostUsername,
-    players: new Map(),
-    selectedTempleId: null,
-    selectedLevelId: null,
-    game: {
-      status: "lobby",
-      nonce: null,
-      startedAt: null,
-      startedAtMs: null,
-    },
-    updatedAt: Date.now(),
-  };
-}
-
-function touchRoom(room) {
-  room.updatedAt = Date.now();
-}
-
-function generateRoomCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    let code = "";
-    for (let index = 0; index < 6; index += 1) {
-      code += chars[Math.floor(Math.random() * chars.length)];
-    }
-    if (!rooms.has(code)) {
-      return code;
-    }
-  }
-  throw new Error("Unable to allocate room code");
-}
-
-function normaliseRoomCode(value) {
-  return String(value || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, 6);
-}
-
-function getOnlineHostProgress(room) {
-  const host = room?.hostUsername ? getUserRecord(room.hostUsername) : null;
-  return cloneProgress(host?.progress_online_host || createEmptyProgress());
-}
-
-function serialiseRoom(room) {
-  return {
-    code: room.code,
-    hostId: room.hostId,
-    hostUsername: room.hostUsername,
-    selectedTempleId: room.selectedTempleId,
-    selectedLevelId: room.selectedLevelId,
-    players: [...room.players.values()].map((player) => ({
-      id: player.id,
-      username: player.username,
-      role: player.role || null,
-      joinedAt: player.joinedAt,
-    })),
-    game: {
-      status: room.game.status,
-      nonce: room.game.nonce,
-      startedAt: room.game.startedAt,
-    },
-    progressOnlineHost: getOnlineHostProgress(room),
-  };
-}
-
-function findPlayerRoom(client) {
-  if (!client.roomCode) {
-    return null;
-  }
-  return rooms.get(client.roomCode) || null;
-}
-
-function sendFrame(socket, payload, opcode = 0x1) {
-  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-  let header;
-
-  if (data.length < 126) {
-    header = Buffer.alloc(2);
-    header[0] = 0x80 | opcode;
-    header[1] = data.length;
-  } else if (data.length < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
-    header[1] = 126;
-    header.writeUInt16BE(data.length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
-    header[1] = 127;
-    header.writeUInt32BE(Math.floor(data.length / 2 ** 32), 2);
-    header.writeUInt32BE(data.length >>> 0, 6);
-  }
-
-  socket.write(Buffer.concat([header, data]));
-}
-
-function sendMessage(client, message) {
-  if (!client.socket.destroyed) {
-    sendFrame(client.socket, JSON.stringify(message));
-  }
-}
-
-function broadcastRoom(room, message, options = {}) {
-  const skipClientId = options.skipClientId || null;
-  touchRoom(room);
-  for (const player of room.players.values()) {
-    if (player.id === skipClientId) {
-      continue;
-    }
-    sendMessage(player.client, message);
-  }
-}
-
-function emitRoomState(room) {
-  broadcastRoom(room, {
-    type: "room_state",
-    room: serialiseRoom(room),
+function writeJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
   });
-}
-
-function fail(client, message) {
-  sendMessage(client, {
-    type: "error",
-    message,
-  });
-}
-
-function removeRoomIfEmpty(room) {
-  if (room.players.size === 0) {
-    rooms.delete(room.code);
-    return true;
-  }
-  return false;
-}
-
-function detachClientFromRoom(client, reason = "left") {
-  const room = findPlayerRoom(client);
-  if (!room) {
-    client.roomCode = null;
-    return;
-  }
-
-  room.players.delete(client.id);
-  client.roomCode = null;
-  touchRoom(room);
-
-  if (room.hostId === client.id) {
-    room.hostId = room.players.size > 0 ? [...room.players.keys()][0] : null;
-    room.hostUsername = room.hostId ? room.players.get(room.hostId)?.username || room.hostUsername : room.hostUsername;
-  }
-
-  if (removeRoomIfEmpty(room)) {
-    return;
-  }
-
-  if (room.players.size < 2 && room.game.status === "playing") {
-    room.game = {
-      status: "lobby",
-      nonce: null,
-      startedAt: null,
-      startedAtMs: null,
-      snapshotSeq: 0,
-    };
-    broadcastRoom(room, {
-      type: "return_to_room",
-      reason: reason === "disconnect" ? "player_left" : reason,
-    });
-  }
-
-  emitRoomState(room);
-}
-
-function joinRoom(client, code) {
-  if (!client.user) {
-    fail(client, "Please log in first.");
-    return;
-  }
-
-  const roomCode = normaliseRoomCode(code);
-  if (!roomCode) {
-    fail(client, "Please enter a valid room code.");
-    return;
-  }
-
-  detachClientFromRoom(client, "switch_room");
-
-  const room = rooms.get(roomCode);
-  if (!room) {
-    fail(client, "房间不存在");
-    return;
-  }
-  if (room.players.size >= 2 && !room.players.has(client.id)) {
-    fail(client, "Room is full.");
-    return;
-  }
-
-  room.players.set(client.id, {
-    id: client.id,
-    username: client.user.username,
-    role: null,
-    joinedAt: nowIso(),
-    client,
-  });
-  client.roomCode = room.code;
-
-  if (!room.hostId || !room.players.has(room.hostId)) {
-    room.hostId = client.id;
-    room.hostUsername = client.user.username;
-  }
-
-  emitRoomState(room);
-}
-
-function updateHostOnlineProgress(room, updater) {
-  const host = room?.hostUsername ? getUserRecord(room.hostUsername) : null;
-  if (!host) {
-    return null;
-  }
-
-  ensureUserProgressShape(host);
-  const next = cloneProgress(host.progress_online_host) || createEmptyProgress();
-  updater(next);
-  next.updatedAt = nowIso();
-  host.progress_online_host = next;
-  host.updatedAt = nowIso();
-  saveAccountsStore();
-  return next;
-}
-
-function handleRoomMessage(client, message) {
-  const room = findPlayerRoom(client);
-  if (!room) {
-    fail(client, "Join or create a room first.");
-    return;
-  }
-
-  const player = room.players.get(client.id);
-  if (!player) {
-    fail(client, "Room state is invalid. Rejoin the room.");
-    return;
-  }
-
-  touchRoom(room);
-
-  switch (message.type) {
-    case "select_level": {
-      if (client.id !== room.hostId) {
-        fail(client, "Only the host can choose a level.");
-        return;
-      }
-
-      room.selectedTempleId = String(message.templeId || "");
-      room.selectedLevelId = String(message.levelId || "");
-      room.game = {
-        status: "lobby",
-        nonce: null,
-        startedAt: null,
-        startedAtMs: null,
-      };
-      emitRoomState(room);
-      return;
-    }
-
-    case "select_role": {
-      const nextRole = message.role == null ? null : String(message.role);
-      if (nextRole !== null && nextRole !== "fb" && nextRole !== "wg") {
-        fail(client, "Invalid role.");
-        return;
-      }
-
-      if (nextRole) {
-        for (const other of room.players.values()) {
-          if (other.id !== client.id && other.role === nextRole) {
-            fail(client, "That role is already taken.");
-            return;
-          }
-        }
-      }
-
-      player.role = nextRole;
-      emitRoomState(room);
-      return;
-    }
-
-    case "start_level": {
-      if (client.id !== room.hostId) {
-        fail(client, "Only the host can start the level.");
-        return;
-      }
-      if (room.players.size !== 2) {
-        fail(client, "Online mode requires 2 players.");
-        return;
-      }
-      if (!room.selectedTempleId || !room.selectedLevelId) {
-        fail(client, "Choose a level first.");
-        return;
-      }
-
-      const roles = [...room.players.values()].map((currentPlayer) => currentPlayer.role);
-      if (!(roles.includes("fb") && roles.includes("wg"))) {
-        fail(client, "Both players must choose different roles.");
-        return;
-      }
-
-      room.game = {
-        status: "playing",
-        nonce: randomId(8),
-        startedAt: nowIso(),
-        startedAtMs: Date.now(),
-      };
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "start_level",
-        room: serialiseRoom(room),
-        elapsedMs: 0,
-      });
-      return;
-    }
-
-    case "retry_level": {
-      if (client.id !== room.hostId) {
-        fail(client, "Only the host can retry.");
-        return;
-      }
-      if (!room.selectedTempleId || !room.selectedLevelId) {
-        fail(client, "No level selected.");
-        return;
-      }
-
-      room.game = {
-        status: "playing",
-        nonce: randomId(8),
-        startedAt: nowIso(),
-        startedAtMs: Date.now(),
-      };
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "start_level",
-        room: serialiseRoom(room),
-        elapsedMs: 0,
-      });
-      return;
-    }
-
-    case "return_to_room": {
-      room.game = {
-        status: "lobby",
-        nonce: null,
-        startedAt: null,
-        startedAtMs: null,
-      };
-      room.selectedTempleId = null;
-      room.selectedLevelId = null;
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "return_to_room",
-        reason: "manual",
-      });
-      return;
-    }
-
-    case "continue_levels": {
-      if (client.id !== room.hostId) {
-        fail(client, "Only the host can continue level selection.");
-        return;
-      }
-
-      room.game = {
-        status: "lobby",
-        nonce: null,
-        startedAt: null,
-        startedAtMs: null,
-      };
-      room.selectedLevelId = null;
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "return_to_room",
-        reason: "continue_levels",
-      }, { skipClientId: room.hostId });
-      return;
-    }
-
-    case "input": {
-      if (room.game.status !== "playing" || room.game.nonce !== message.nonce) {
-        return;
-      }
-      broadcastRoom(room, {
-        type: "player_input",
-        clientId: client.id,
-        role: player.role,
-        nonce: message.nonce,
-        seq: Number(message.seq || 0),
-        state: {
-          left: !!message.state?.left,
-          right: !!message.state?.right,
-          up: !!message.state?.up,
-        },
-      }, { skipClientId: client.id });
-      return;
-    }
-
-    case "snapshot": {
-      if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
-        return;
-      }
-      broadcastRoom(room, {
-        type: "level_snapshot",
-        nonce: message.nonce,
-        elapsedMs: Math.max(0, Date.now() - (room.game.startedAtMs || Date.now())),
-        bodies: Array.isArray(message.bodies) ? message.bodies : [],
-        players: message.players || null,
-      });
-      return;
-    }
-
-    case "complete_level":
-    case "level_complete": {
-      if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
-        return;
-      }
-
-      updateHostOnlineProgress(room, (progress) => {
-        const key = `${room.selectedTempleId}:${room.selectedLevelId}`;
-        if (!progress.completedLevels.includes(key)) {
-          progress.completedLevels.push(key);
-        }
-      });
-
-      room.game.status = "ended";
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "online_finish_animation",
-        nonce: message.nonce,
-      }, { skipClientId: room.hostId });
-      broadcastRoom(room, {
-        type: "level_complete",
-        nonce: message.nonce,
-        payload: message.payload || null,
-      });
-      return;
-    }
-
-    case "level_failed": {
-      if (client.id !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
-        return;
-      }
-      room.game.status = "ended";
-      emitRoomState(room);
-      broadcastRoom(room, {
-        type: "level_failed",
-        nonce: message.nonce,
-        payload: message.payload || null,
-      });
-      return;
-    }
-
-    default:
-      fail(client, `Unknown message type: ${message.type}`);
-  }
-}
-
-function handleMessage(client, message) {
-  switch (message.type) {
-    case "authenticate": {
-      const token = String(message.token || "");
-      const session = sessions.get(token);
-      if (!session) {
-        client.user = null;
-        fail(client, "Login expired. Please log in again.");
-        return;
-      }
-      const user = getUserRecord(session.username);
-      if (!user) {
-        fail(client, "Account does not exist.");
-        return;
-      }
-      client.user = {
-        username: user.username,
-      };
-      sendMessage(client, {
-        type: "authenticated",
-        user: {
-          username: user.username,
-        },
-      });
-      return;
-    }
-
-    case "create_room": {
-      if (!client.user) {
-        fail(client, "Please log in first.");
-        return;
-      }
-      const code = generateRoomCode();
-      const room = createRoom(code, client.user.username);
-      rooms.set(code, room);
-      joinRoom(client, code);
-      return;
-    }
-
-    case "join_room": {
-      joinRoom(client, message.roomCode);
-      return;
-    }
-
-    case "leave_room": {
-      detachClientFromRoom(client, "left");
-      return;
-    }
-
-    default:
-      handleRoomMessage(client, message);
-  }
-}
-
-function decodeFrame(buffer) {
-  if (buffer.length < 2) {
-    return null;
-  }
-
-  const firstByte = buffer[0];
-  const secondByte = buffer[1];
-  const opcode = firstByte & 0x0f;
-  const masked = (secondByte & 0x80) === 0x80;
-  let length = secondByte & 0x7f;
-  let offset = 2;
-
-  if (length === 126) {
-    if (buffer.length < 4) {
-      return null;
-    }
-    length = buffer.readUInt16BE(2);
-    offset = 4;
-  } else if (length === 127) {
-    if (buffer.length < 10) {
-      return null;
-    }
-    const high = buffer.readUInt32BE(2);
-    const low = buffer.readUInt32BE(6);
-    length = high * 2 ** 32 + low;
-    offset = 10;
-  }
-
-  const maskSize = masked ? 4 : 0;
-  if (length > MAX_MESSAGE_BYTES) {
-    throw new Error("WebSocket payload too large.");
-  }
-  if (buffer.length < offset + maskSize + length) {
-    return null;
-  }
-
-  let payload;
-  if (masked) {
-    const mask = buffer.subarray(offset, offset + 4);
-    const dataStart = offset + 4;
-    payload = Buffer.alloc(length);
-    for (let index = 0; index < length; index += 1) {
-      payload[index] = buffer[dataStart + index] ^ mask[index % 4];
-    }
-    offset = dataStart + length;
-  } else {
-    payload = buffer.subarray(offset, offset + length);
-    offset += length;
-  }
-
-  return {
-    opcode,
-    bytesConsumed: offset,
-    payload,
-  };
-}
-
-function createWebSocketClient(socket) {
-  return {
-    id: randomId(6),
-    socket,
-    buffer: Buffer.alloc(0),
-    roomCode: null,
-    user: null,
-    lastSeenAt: Date.now(),
-    lastPongAt: Date.now(),
-    isAlive: true,
-  };
-}
-
-function closeSocket(client) {
-  if (client.socket.destroyed) {
-    return;
-  }
-  try {
-    sendFrame(client.socket, Buffer.alloc(0), 0x8);
-    client.socket.end();
-  } catch (error) {
-    client.socket.destroy();
-  }
-}
-
-function destroyClient(client, reason = "disconnect") {
-  detachClientFromRoom(client, reason);
-  clients.delete(client.id);
-  closeSocket(client);
-}
-
-function handleSocketData(client, chunk) {
-  client.lastSeenAt = Date.now();
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-
-  while (true) {
-    let frame;
-    try {
-      frame = decodeFrame(client.buffer);
-    } catch (error) {
-      destroyClient(client, "bad_frame");
-      return;
-    }
-
-    if (!frame) {
-      return;
-    }
-
-    client.buffer = client.buffer.subarray(frame.bytesConsumed);
-
-    if (frame.opcode === 0x8) {
-      destroyClient(client, "close_frame");
-      return;
-    }
-    if (frame.opcode === 0x9) {
-      sendFrame(client.socket, frame.payload, 0x0a);
-      continue;
-    }
-    if (frame.opcode === 0x0a) {
-      client.isAlive = true;
-      client.lastPongAt = Date.now();
-      continue;
-    }
-    if (frame.opcode !== 0x1) {
-      continue;
-    }
-
-    try {
-      const message = JSON.parse(frame.payload.toString("utf8"));
-      handleMessage(client, message);
-    } catch (error) {
-      fail(client, "Invalid message payload.");
-    }
-  }
+  response.end(JSON.stringify(payload));
 }
 
 function readJsonBody(request) {
@@ -890,21 +160,862 @@ function readJsonBody(request) {
   });
 }
 
-function writeJson(response, statusCode, payload) {
-  response.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
+const manifest = loadGameManifest(ROOT);
+const database = createDatabase({
+  rootDir: ROOT,
+  dbFile: DB_FILE,
+  legacyAccountsFile: LEGACY_ACCOUNTS_FILE,
+  manifest,
+});
+
+function getSessionTokenFromRequest(request) {
+  const auth = request.headers.authorization || "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (bearerToken) {
+    return bearerToken;
+  }
+  const cookies = parseCookies(request.headers.cookie || "");
+  return cookies.fb5_session || "";
+}
+
+function getSessionFromRequest(request) {
+  const token = getSessionTokenFromRequest(request);
+  if (!token) {
+    return null;
+  }
+  return database.getSession(token, Date.now());
+}
+
+function getUserFromRequest(request) {
+  const session = getSessionFromRequest(request);
+  if (!session) {
+    return null;
+  }
+  return database.getUserById(session.user_id);
+}
+
+function createRoom(code, hostUser) {
+  const hostPlayerId = `user:${hostUser.id}`;
+  return {
+    code,
+    hostId: hostPlayerId,
+    hostUsername: hostUser.username,
+    players: new Map(),
+    selectedTempleId: null,
+    selectedLevelId: null,
+    game: {
+      status: "lobby",
+      nonce: null,
+      startedAt: null,
+      startedAtMs: null,
+    },
+    lastSnapshot: null,
+    updatedAt: Date.now(),
+  };
+}
+
+const rooms = new Map();
+const clients = new Map();
+
+function touchRoom(room) {
+  room.updatedAt = Date.now();
+}
+
+function generateRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    let code = "";
+    for (let index = 0; index < 6; index += 1) {
+      code += chars[Math.floor(Math.random() * chars.length)];
+    }
+    if (!rooms.has(code)) {
+      return code;
+    }
+  }
+  throw new Error("Unable to allocate room code");
+}
+
+function normaliseRoomCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6);
+}
+
+function createPlayerId(user) {
+  return `user:${user.id}`;
+}
+
+function getOnlineHostProgress(room) {
+  if (!room || !room.hostId) {
+    return database.createEmptyProgress();
+  }
+  const hostPlayer = room.players.get(room.hostId);
+  if (!hostPlayer) {
+    return database.createEmptyProgress();
+  }
+  return database.getProgress(hostPlayer.userId, "online_host");
+}
+
+function serialiseRoom(room) {
+  return {
+    code: room.code,
+    hostId: room.hostId,
+    hostUsername: room.hostUsername,
+    selectedTempleId: room.selectedTempleId,
+    selectedLevelId: room.selectedLevelId,
+    players: Array.from(room.players.values()).map((player) => ({
+      id: player.id,
+      username: player.username,
+      role: player.role || null,
+      joinedAt: player.joinedAt,
+      connected: !player.disconnectedAt,
+    })),
+    game: {
+      status: room.game.status,
+      nonce: room.game.nonce,
+      startedAt: room.game.startedAt,
+    },
+    progressOnlineHost: getOnlineHostProgress(room),
+  };
+}
+
+function sendMessage(client, message) {
+  if (!client || client.closed || client.ws.readyState !== client.ws.OPEN) {
+    return;
+  }
+  client.ws.send(JSON.stringify(message));
+}
+
+function broadcastRoom(room, message, options = {}) {
+  const skipPlayerId = options.skipPlayerId || null;
+  touchRoom(room);
+  room.players.forEach((player) => {
+    if (player.id === skipPlayerId || !player.client || player.disconnectedAt) {
+      return;
+    }
+    sendMessage(player.client, message);
   });
-  response.end(JSON.stringify(payload));
+}
+
+function emitRoomState(room) {
+  broadcastRoom(room, {
+    type: "room_state",
+    room: serialiseRoom(room),
+  });
+}
+
+function fail(client, message) {
+  sendMessage(client, {
+    type: "error",
+    message,
+  });
+}
+
+function findPlayerRoom(client) {
+  if (!client.roomCode) {
+    return null;
+  }
+  return rooms.get(client.roomCode) || null;
+}
+
+function findRoomByPlayerId(playerId) {
+  for (const room of rooms.values()) {
+    if (room.players.has(playerId)) {
+      return room;
+    }
+  }
+  return null;
+}
+
+function removeRoomIfEmpty(room) {
+  if (room.players.size === 0) {
+    rooms.delete(room.code);
+    return true;
+  }
+  return false;
+}
+
+function attachClientToExistingPlayer(client, room, player) {
+  if (player.client && player.client !== client) {
+    player.client.roomCode = null;
+    player.client.closed = true;
+    try {
+      player.client.ws.close(1000, "replaced");
+    } catch (error) {}
+    clients.delete(player.client.id);
+  }
+
+  player.client = client;
+  player.disconnectedAt = null;
+  client.user = {
+    id: player.userId,
+    username: player.username,
+  };
+  client.playerId = player.id;
+  client.roomCode = room.code;
+}
+
+function leaveRoom(client, reason = "left", options = {}) {
+  const room = options.room || findPlayerRoom(client);
+  if (!room || !client.playerId) {
+    client.roomCode = null;
+    return;
+  }
+
+  const player = room.players.get(client.playerId);
+  if (!player) {
+    client.roomCode = null;
+    return;
+  }
+
+  if (player.client === client) {
+    player.client = null;
+  }
+
+  room.players.delete(player.id);
+  client.roomCode = null;
+
+  if (room.hostId === player.id) {
+    const nextConnectedHost = Array.from(room.players.values()).find((candidate) => !candidate.disconnectedAt);
+    const nextHost = nextConnectedHost || Array.from(room.players.values())[0] || null;
+    room.hostId = nextHost ? nextHost.id : null;
+    room.hostUsername = nextHost ? nextHost.username : room.hostUsername;
+  }
+
+  if (removeRoomIfEmpty(room)) {
+    return;
+  }
+
+  if (room.players.size < 2 && room.game.status === "playing") {
+    room.game = {
+      status: "lobby",
+      nonce: null,
+      startedAt: null,
+      startedAtMs: null,
+    };
+    room.lastSnapshot = null;
+    broadcastRoom(room, {
+      type: "return_to_room",
+      reason,
+    });
+  }
+
+  touchRoom(room);
+  emitRoomState(room);
+}
+
+function disconnectClient(client, reason = "disconnect") {
+  const room = findPlayerRoom(client);
+  if (!room || !client.playerId) {
+    client.roomCode = null;
+    return;
+  }
+
+  const player = room.players.get(client.playerId);
+  if (!player || player.client !== client) {
+    client.roomCode = null;
+    return;
+  }
+
+  player.client = null;
+  player.disconnectedAt = Date.now();
+  client.roomCode = null;
+  touchRoom(room);
+  emitRoomState(room);
+}
+
+function joinRoom(client, code) {
+  if (!client.user || !client.playerId) {
+    fail(client, "Please log in first.");
+    return;
+  }
+
+  const roomCode = normaliseRoomCode(code);
+  if (!roomCode) {
+    fail(client, "Please enter a valid room code.");
+    return;
+  }
+
+  const currentRoom = findPlayerRoom(client);
+  if (currentRoom) {
+    leaveRoom(client, "switch_room", { room: currentRoom });
+  }
+
+  const room = rooms.get(roomCode);
+  if (!room) {
+    fail(client, "房间不存在");
+    return;
+  }
+
+  if (room.players.has(client.playerId)) {
+    const existingPlayer = room.players.get(client.playerId);
+    attachClientToExistingPlayer(client, room, existingPlayer);
+    touchRoom(room);
+    emitRoomState(room);
+    if (room.game.status === "playing" && room.selectedTempleId && room.selectedLevelId) {
+      sendMessage(client, {
+        type: "start_level",
+        room: serialiseRoom(room),
+        elapsedMs: Math.max(0, Date.now() - (room.game.startedAtMs || Date.now())),
+        snapshot: room.lastSnapshot,
+        resumed: true,
+      });
+    }
+    return;
+  }
+
+  if (room.players.size >= 2) {
+    fail(client, "Room is full.");
+    return;
+  }
+
+  room.players.set(client.playerId, {
+    id: client.playerId,
+    userId: client.user.id,
+    username: client.user.username,
+    role: null,
+    joinedAt: nowIso(),
+    disconnectedAt: null,
+    client,
+  });
+  client.roomCode = room.code;
+
+  if (!room.hostId || !room.players.has(room.hostId)) {
+    room.hostId = client.playerId;
+    room.hostUsername = client.user.username;
+  }
+
+  touchRoom(room);
+  emitRoomState(room);
+}
+
+function resumePlayerRoom(client) {
+  if (!client.playerId) {
+    sendMessage(client, { type: "room_state", room: null });
+    return;
+  }
+
+  const room = findRoomByPlayerId(client.playerId);
+  if (!room) {
+    sendMessage(client, { type: "room_state", room: null });
+    return;
+  }
+
+  const player = room.players.get(client.playerId);
+  if (!player) {
+    sendMessage(client, { type: "room_state", room: null });
+    return;
+  }
+
+  if (player.disconnectedAt && player.disconnectedAt + RECONNECT_GRACE_MS < Date.now()) {
+    room.players.delete(player.id);
+    removeRoomIfEmpty(room);
+    sendMessage(client, { type: "room_state", room: null });
+    return;
+  }
+
+  attachClientToExistingPlayer(client, room, player);
+  touchRoom(room);
+  sendMessage(client, {
+    type: "room_state",
+    room: serialiseRoom(room),
+  });
+
+  if (room.game.status === "playing" && room.selectedTempleId && room.selectedLevelId) {
+    sendMessage(client, {
+      type: "start_level",
+      room: serialiseRoom(room),
+      elapsedMs: Math.max(0, Date.now() - (room.game.startedAtMs || Date.now())),
+      snapshot: room.lastSnapshot,
+      resumed: true,
+    });
+  }
+
+  emitRoomState(room);
+}
+
+function createClient(ws, request) {
+  const user = getUserFromRequest(request);
+  const playerId = user ? createPlayerId(user) : null;
+  return {
+    id: randomId(6),
+    ws,
+    request,
+    closed: false,
+    roomCode: null,
+    user,
+    playerId,
+    isAlive: true,
+    connectedAt: Date.now(),
+  };
+}
+
+function getModeFromRequest(requestUrl, bodyMode) {
+  const rawMode = String(bodyMode || parseQueryValue(requestUrl, "mode") || "single");
+  return rawMode === "online_host" ? "online_host" : "single";
+}
+
+function requireUser(request, response) {
+  const user = getUserFromRequest(request);
+  if (!user) {
+    writeJson(response, 401, { ok: false, message: "Not logged in." });
+    return null;
+  }
+  return user;
+}
+
+function handleRoomMessage(client, message) {
+  const room = findPlayerRoom(client);
+  if (!room) {
+    fail(client, "Join or create a room first.");
+    return;
+  }
+
+  const player = room.players.get(client.playerId);
+  if (!player) {
+    fail(client, "Room state is invalid. Rejoin the room.");
+    return;
+  }
+
+  touchRoom(room);
+
+  switch (message.type) {
+    case "select_level": {
+      if (client.playerId !== room.hostId) {
+        fail(client, "Only the host can choose a level.");
+        return;
+      }
+
+      const levelKey = resolveLevelKey(manifest, message.templeId, message.levelId, message.filename);
+      if (!levelKey) {
+        fail(client, "Invalid level selection.");
+        return;
+      }
+
+      const [templeId, levelId] = levelKey.split(":");
+      room.selectedTempleId = templeId;
+      room.selectedLevelId = levelId;
+      room.game = {
+        status: "lobby",
+        nonce: null,
+        startedAt: null,
+        startedAtMs: null,
+      };
+      room.lastSnapshot = null;
+      emitRoomState(room);
+      return;
+    }
+
+    case "select_role": {
+      const nextRole = message.role == null ? null : String(message.role);
+      if (nextRole !== null && nextRole !== "fb" && nextRole !== "wg") {
+        fail(client, "Invalid role.");
+        return;
+      }
+
+      if (nextRole) {
+        for (const other of room.players.values()) {
+          if (other.id !== client.playerId && other.role === nextRole) {
+            fail(client, "That role is already taken.");
+            return;
+          }
+        }
+      }
+
+      player.role = nextRole;
+      emitRoomState(room);
+      return;
+    }
+
+    case "start_level":
+    case "retry_level": {
+      if (client.playerId !== room.hostId) {
+        fail(client, "Only the host can start the level.");
+        return;
+      }
+      if (room.players.size !== 2) {
+        fail(client, "Online mode requires 2 players.");
+        return;
+      }
+      if (!room.selectedTempleId || !room.selectedLevelId) {
+        fail(client, "Choose a level first.");
+        return;
+      }
+
+      const roles = Array.from(room.players.values()).map((currentPlayer) => currentPlayer.role);
+      if (!(roles.includes("fb") && roles.includes("wg"))) {
+        fail(client, "Both players must choose different roles.");
+        return;
+      }
+
+      room.game = {
+        status: "playing",
+        nonce: randomId(8),
+        startedAt: nowIso(),
+        startedAtMs: Date.now(),
+      };
+      room.lastSnapshot = null;
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "start_level",
+        room: serialiseRoom(room),
+        elapsedMs: 0,
+      });
+      return;
+    }
+
+    case "return_to_room": {
+      room.game = {
+        status: "lobby",
+        nonce: null,
+        startedAt: null,
+        startedAtMs: null,
+      };
+      room.lastSnapshot = null;
+      room.selectedTempleId = null;
+      room.selectedLevelId = null;
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "return_to_room",
+        reason: "manual",
+      });
+      return;
+    }
+
+    case "continue_levels": {
+      if (client.playerId !== room.hostId) {
+        fail(client, "Only the host can continue level selection.");
+        return;
+      }
+
+      room.game = {
+        status: "lobby",
+        nonce: null,
+        startedAt: null,
+        startedAtMs: null,
+      };
+      room.lastSnapshot = null;
+      room.selectedLevelId = null;
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "return_to_room",
+        reason: "continue_levels",
+      }, { skipPlayerId: room.hostId });
+      return;
+    }
+
+    case "input": {
+      if (room.game.status !== "playing" || room.game.nonce !== message.nonce) {
+        return;
+      }
+      broadcastRoom(room, {
+        type: "player_input",
+        playerId: client.playerId,
+        role: player.role,
+        nonce: message.nonce,
+        seq: Number(message.seq || 0),
+        state: {
+          left: !!message.state?.left,
+          right: !!message.state?.right,
+          up: !!message.state?.up,
+        },
+      }, { skipPlayerId: client.playerId });
+      return;
+    }
+
+    case "snapshot": {
+      if (client.playerId !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
+        return;
+      }
+      room.lastSnapshot = {
+        elapsedMs: Math.max(0, Number(message.elapsedMs || 0)),
+        bodies: Array.isArray(message.bodies) ? message.bodies : [],
+        players: message.players || null,
+      };
+      broadcastRoom(room, {
+        type: "level_snapshot",
+        nonce: message.nonce,
+        elapsedMs: room.lastSnapshot.elapsedMs,
+        bodies: room.lastSnapshot.bodies,
+        players: room.lastSnapshot.players,
+      }, { skipPlayerId: client.playerId });
+      return;
+    }
+
+    case "level_complete": {
+      if (client.playerId !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
+        return;
+      }
+
+      const hostPlayer = room.players.get(room.hostId);
+      const progress = database.markLevelComplete(
+        hostPlayer.userId,
+        "online_host",
+        room.selectedTempleId,
+        room.selectedLevelId,
+      );
+      if (!progress) {
+        fail(client, "Unable to persist level completion.");
+        return;
+      }
+
+      room.game.status = "ended";
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "online_finish_animation",
+        nonce: message.nonce,
+      }, { skipPlayerId: room.hostId });
+      broadcastRoom(room, {
+        type: "level_complete",
+        nonce: message.nonce,
+        payload: message.payload || null,
+        progress,
+      });
+      return;
+    }
+
+    case "level_failed": {
+      if (client.playerId !== room.hostId || room.game.status !== "playing" || room.game.nonce !== message.nonce) {
+        return;
+      }
+      room.game.status = "ended";
+      emitRoomState(room);
+      broadcastRoom(room, {
+        type: "level_failed",
+        nonce: message.nonce,
+        payload: message.payload || null,
+      });
+      return;
+    }
+
+    default:
+      fail(client, `Unknown message type: ${message.type}`);
+  }
+}
+
+function handleMessage(client, message) {
+  if (!message || typeof message.type !== "string") {
+    fail(client, "Invalid message payload.");
+    return;
+  }
+
+  switch (message.type) {
+    case "authenticate": {
+      if (!client.user) {
+        fail(client, "Login expired. Please log in again.");
+        return;
+      }
+      sendMessage(client, {
+        type: "authenticated",
+        user: {
+          id: client.user.id,
+          username: client.user.username,
+        },
+        playerId: client.playerId,
+      });
+      resumePlayerRoom(client);
+      return;
+    }
+
+    case "create_room": {
+      if (!client.user) {
+        fail(client, "Please log in first.");
+        return;
+      }
+      const existingRoom = findPlayerRoom(client);
+      if (existingRoom) {
+        leaveRoom(client, "switch_room", { room: existingRoom });
+      }
+      const code = generateRoomCode();
+      const room = createRoom(code, client.user);
+      rooms.set(code, room);
+      room.players.set(client.playerId, {
+        id: client.playerId,
+        userId: client.user.id,
+        username: client.user.username,
+        role: null,
+        joinedAt: nowIso(),
+        disconnectedAt: null,
+        client,
+      });
+      client.roomCode = room.code;
+      emitRoomState(room);
+      return;
+    }
+
+    case "join_room":
+      joinRoom(client, message.roomCode);
+      return;
+
+    case "leave_room":
+      leaveRoom(client, "left");
+      sendMessage(client, { type: "room_state", room: null });
+      return;
+
+    default:
+      handleRoomMessage(client, message);
+  }
+}
+
+async function handleRegister(request, response) {
+  try {
+    const body = await readJsonBody(request);
+    const username = normaliseUsername(body.username);
+    const password = String(body.password || "");
+    const error = validateCredentials(username, password);
+
+    if (error) {
+      writeJson(response, 400, { ok: false, message: error });
+      return;
+    }
+    if (database.getUserByUsername(username)) {
+      writeJson(response, 400, { ok: false, message: "Account already exists." });
+      return;
+    }
+
+    const now = nowIso();
+    const passwordState = hashPassword(password);
+    const user = database.createUser({
+      username,
+      username_key: username.toLowerCase(),
+      password_salt: passwordState.salt,
+      password_hash: passwordState.hash,
+      created_at: now,
+      updated_at: now,
+    });
+
+    const token = randomId(24);
+    const createdAtMs = Date.now();
+    database.createSession(token, user.id, createdAtMs, createdAtMs + SESSION_TTL_MS);
+    setSessionCookie(response, token);
+
+    writeJson(response, 200, {
+      ok: true,
+      ...database.getAuthPayload(user),
+    });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Invalid register request." });
+  }
+}
+
+async function handleLogin(request, response) {
+  try {
+    const body = await readJsonBody(request);
+    const username = normaliseUsername(body.username);
+    const password = String(body.password || "");
+    const user = database.getUserByUsername(username);
+
+    if (!user || !verifyPassword(password, user)) {
+      writeJson(response, 401, { ok: false, message: "Invalid username or password." });
+      return;
+    }
+
+    const token = randomId(24);
+    const createdAtMs = Date.now();
+    database.createSession(token, user.id, createdAtMs, createdAtMs + SESSION_TTL_MS);
+    setSessionCookie(response, token);
+
+    writeJson(response, 200, {
+      ok: true,
+      ...database.getAuthPayload(user),
+    });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Invalid login request." });
+  }
+}
+
+function handleMe(request, response) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  writeJson(response, 200, {
+    ok: true,
+    ...database.getAuthPayload(user),
+  });
+}
+
+function handleLogout(request, response) {
+  const sessionToken = getSessionTokenFromRequest(request);
+  if (sessionToken) {
+    database.deleteSession(sessionToken);
+  }
+  clearSessionCookie(response);
+  writeJson(response, 200, { ok: true });
+}
+
+async function handleProgressMarkComplete(request, response) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  try {
+    const body = await readJsonBody(request);
+    const mode = getModeFromRequest(request.url, body.mode);
+    const progress = database.markLevelComplete(
+      user.id,
+      mode,
+      body.templeId,
+      body.levelId,
+      body.filename,
+    );
+
+    if (!progress) {
+      writeJson(response, 400, { ok: false, message: "Invalid level identifier." });
+      return;
+    }
+
+    writeJson(response, 200, { ok: true, progress });
+  } catch (error) {
+    writeJson(response, 400, { ok: false, message: "Progress update failed." });
+  }
+}
+
+function handleProgressReset(request, response) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const mode = getModeFromRequest(request.url);
+  const progress = database.resetProgress(user.id, mode);
+  writeJson(response, 200, { ok: true, progress });
+}
+
+function handleProgressCompleteAll(request, response) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const mode = getModeFromRequest(request.url);
+  const progress = database.completeAllProgress(user.id, mode);
+  writeJson(response, 200, { ok: true, progress });
+}
+
+function handleGameManifest(request, response) {
+  writeJson(response, 200, createManifestResponse(manifest));
 }
 
 function getSafePath(urlPath) {
   const decodedPath = decodeURIComponent((urlPath || "/").split("?")[0] || "/");
-  const relativePath = decodedPath === "/" ? "/index.html" : decodedPath;
-  const resolvedPath = path.resolve(path.join(ROOT, `.${relativePath}`));
-  if (!resolvedPath.startsWith(ROOT)) {
-    return null;
+  const relativePath = decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "");
+  const resolvedPath = path.resolve(ROOT, relativePath);
+  const relative = path.relative(ROOT, resolvedPath);
+
+  if (
+    relative.startsWith("..") ||
+    path.isAbsolute(relative) ||
+    relative.includes(`..${path.sep}`) ||
+    relative === ""
+  ) {
+    return decodedPath === "/" ? path.join(ROOT, "index.html") : null;
   }
+
   return resolvedPath;
 }
 
@@ -934,232 +1045,6 @@ function serveStaticFile(request, response) {
   });
 }
 
-function cleanupIdleRooms() {
-  const cutoff = Date.now() - ROOM_IDLE_TTL_MS;
-  for (const room of rooms.values()) {
-    if (room.players.size === 0 || room.updatedAt < cutoff) {
-      rooms.delete(room.code);
-    }
-  }
-}
-
-function pingClients() {
-  const payload = Buffer.from(String(Date.now()));
-  for (const client of clients.values()) {
-    if (client.socket.destroyed) {
-      destroyClient(client, "socket_destroyed");
-      continue;
-    }
-    if (!client.isAlive && Date.now() - client.lastPongAt > CLIENT_PING_INTERVAL_MS * 2) {
-      destroyClient(client, "ping_timeout");
-      continue;
-    }
-    client.isAlive = false;
-    try {
-      sendFrame(client.socket, payload, 0x9);
-    } catch (error) {
-      destroyClient(client, "ping_failed");
-    }
-  }
-}
-
-async function handleRegister(request, response) {
-  try {
-    const body = await readJsonBody(request);
-    const username = normaliseUsername(body.username);
-    const password = String(body.password || "");
-    const error = validateCredentials(username, password);
-
-    if (error) {
-      writeJson(response, 400, { ok: false, message: error });
-      return;
-    }
-    if (getUserRecord(username)) {
-      writeJson(response, 400, { ok: false, message: "Account already exists." });
-      return;
-    }
-
-    const passwordState = hashPassword(password);
-    accountsStore.users[usernameKey(username)] = {
-      username,
-      passwordSalt: passwordState.salt,
-      passwordHash: passwordState.hash,
-      progress_single: createEmptyProgress(),
-      progress_online_host: createEmptyProgress(),
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    };
-    saveAccountsStore();
-
-    const token = createSession(username);
-    setSessionCookie(response, token);
-    writeJson(response, 200, {
-      ok: true,
-      token,
-      user: { username },
-      progressSingle: createEmptyProgress(),
-      progressOnlineHost: createEmptyProgress(),
-    });
-  } catch (error) {
-    writeJson(response, 400, { ok: false, message: "Invalid register request." });
-  }
-}
-
-async function handleLogin(request, response) {
-  try {
-    const body = await readJsonBody(request);
-    const username = normaliseUsername(body.username);
-    const password = String(body.password || "");
-    const user = getUserRecord(username);
-
-    if (!user || !verifyPassword(password, user)) {
-      writeJson(response, 401, { ok: false, message: "Invalid username or password." });
-      return;
-    }
-
-    const token = createSession(user.username);
-    setSessionCookie(response, token);
-    writeJson(response, 200, {
-      ok: true,
-      token,
-      user: { username: user.username },
-      progressSingle: cloneProgress(user.progress_single),
-      progressOnlineHost: cloneProgress(user.progress_online_host),
-    });
-  } catch (error) {
-    writeJson(response, 400, { ok: false, message: "Invalid login request." });
-  }
-}
-
-function handleMe(request, response) {
-  const session = getSessionFromRequest(request);
-  if (!session) {
-    clearSessionCookie(response);
-    writeJson(response, 401, { ok: false, message: "Not logged in." });
-    return;
-  }
-
-  const user = getUserRecord(session.username);
-  if (!user) {
-    clearSessionCookie(response);
-    writeJson(response, 401, { ok: false, message: "Account does not exist." });
-    return;
-  }
-
-  writeJson(response, 200, {
-    ok: true,
-    user: { username: user.username },
-    progressSingle: cloneProgress(user.progress_single),
-    progressOnlineHost: cloneProgress(user.progress_online_host),
-  });
-}
-
-function handleLogout(request, response) {
-  clearSessionCookie(response);
-  writeJson(response, 200, { ok: true });
-}
-
-async function handleProgressSave(request, response) {
-  const session = getSessionFromRequest(request);
-  if (!session) {
-    writeJson(response, 401, { ok: false, message: "Not logged in." });
-    return;
-  }
-
-  const user = getUserRecord(session.username);
-  if (!user) {
-    writeJson(response, 401, { ok: false, message: "Account does not exist." });
-    return;
-  }
-
-  try {
-    const body = await readJsonBody(request);
-    const mode = String(body.mode || "single");
-    if (mode === "online_host") {
-      user.progress_online_host = cloneProgress(body.progress || createEmptyProgress());
-    } else {
-      user.progress_single = cloneProgress(body.progress || createEmptyProgress());
-    }
-    user.updatedAt = nowIso();
-    saveAccountsStore();
-    writeJson(response, 200, { ok: true });
-  } catch (error) {
-    writeJson(response, 400, { ok: false, message: "Progress save failed." });
-  }
-}
-
-function getModeFromUrl(url) {
-  return String((url.split("?")[1] || "").includes("mode=online_host") ? "online_host" : "single");
-}
-
-function handleProgressReset(request, response) {
-  const session = getSessionFromRequest(request);
-  if (!session) {
-    writeJson(response, 401, { ok: false, message: "Not logged in." });
-    return;
-  }
-
-  const user = getUserRecord(session.username);
-  if (!user) {
-    writeJson(response, 401, { ok: false, message: "Account does not exist." });
-    return;
-  }
-
-  const mode = getModeFromUrl(request.url);
-  if (mode === "online_host") {
-    user.progress_online_host = createEmptyProgress();
-  } else {
-    user.progress_single = createEmptyProgress();
-  }
-  user.updatedAt = nowIso();
-  saveAccountsStore();
-  writeJson(response, 200, { ok: true });
-}
-
-function collectAllLevelIds() {
-  const gameConfig = readJsonFile(path.join(ROOT, "game.json"));
-  const templePaths = Array.isArray(gameConfig.temples) ? gameConfig.temples : [];
-  const completedLevels = [];
-
-  templePaths.forEach((templePath) => {
-    const temple = readJsonFile(path.join(ROOT, "data", templePath, "temple.json"));
-    (temple.levels || []).forEach((level) => {
-      completedLevels.push(`${temple.id}:${level.id}`);
-    });
-  });
-
-  return completedLevels;
-}
-
-function handleProgressCompleteAll(request, response) {
-  const session = getSessionFromRequest(request);
-  if (!session) {
-    writeJson(response, 401, { ok: false, message: "Not logged in." });
-    return;
-  }
-
-  const user = getUserRecord(session.username);
-  if (!user) {
-    writeJson(response, 401, { ok: false, message: "Account does not exist." });
-    return;
-  }
-
-  const mode = getModeFromUrl(request.url);
-  const nextProgress = {
-    completedLevels: collectAllLevelIds(),
-    updatedAt: nowIso(),
-  };
-
-  if (mode === "online_host") {
-    user.progress_online_host = nextProgress;
-  } else {
-    user.progress_single = nextProgress;
-  }
-  user.updatedAt = nowIso();
-  saveAccountsStore();
-  writeJson(response, 200, { ok: true, progress: nextProgress });
-}
-
 const server = http.createServer((request, response) => {
   if (request.url === "/healthz") {
     writeJson(response, 200, {
@@ -1167,10 +1052,21 @@ const server = http.createServer((request, response) => {
       uptimeSeconds: Math.round(process.uptime()),
       activeRooms: rooms.size,
       activeClients: clients.size,
-      accounts: Object.keys(accountsStore.users).length,
-      accountsFile: ACCOUNTS_FILE,
+      accounts: Number(database.db.prepare("SELECT COUNT(*) AS count FROM users").get().count),
+      dbFile: DB_FILE,
+      levels: listAllLevelKeys(manifest).length,
       timestamp: nowIso(),
     });
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/api/auth/me") {
+    handleMe(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/api/game-manifest") {
+    handleGameManifest(request, response);
     return;
   }
 
@@ -1184,18 +1080,8 @@ const server = http.createServer((request, response) => {
     return;
   }
 
-  if (request.method === "GET" && request.url === "/api/auth/me") {
-    handleMe(request, response);
-    return;
-  }
-
   if (request.method === "POST" && request.url === "/api/logout") {
     handleLogout(request, response);
-    return;
-  }
-
-  if (request.method === "POST" && request.url.startsWith("/api/progress/save")) {
-    handleProgressSave(request, response);
     return;
   }
 
@@ -1209,6 +1095,19 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  if (request.method === "POST" && request.url === "/api/progress/mark-complete") {
+    handleProgressMarkComplete(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && request.url.startsWith("/api/progress/save")) {
+    writeJson(response, 410, {
+      ok: false,
+      message: "Raw progress save is disabled. Use server-authoritative progress endpoints instead.",
+    });
+    return;
+  }
+
   if (request.method !== "GET") {
     response.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
     response.end("Method not allowed");
@@ -1218,62 +1117,168 @@ const server = http.createServer((request, response) => {
   serveStaticFile(request, response);
 });
 
-server.on("upgrade", (request, socket) => {
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
+
+wss.on("connection", (ws, request) => {
+  const client = createClient(ws, request);
+  clients.set(client.id, client);
+
+  sendMessage(client, {
+    type: "welcome",
+  });
+
+  if (client.user) {
+    sendMessage(client, {
+      type: "authenticated",
+      user: {
+        id: client.user.id,
+        username: client.user.username,
+      },
+      playerId: client.playerId,
+    });
+    resumePlayerRoom(client);
+  } else {
+    sendMessage(client, {
+      type: "room_state",
+      room: null,
+    });
+  }
+
+  ws.on("pong", () => {
+    client.isAlive = true;
+  });
+
+  ws.on("message", (payload, isBinary) => {
+    if (isBinary) {
+      fail(client, "Binary payloads are not supported.");
+      return;
+    }
+
+    try {
+      const message = JSON.parse(String(payload));
+      handleMessage(client, message);
+    } catch (error) {
+      fail(client, "Invalid message payload.");
+    }
+  });
+
+  ws.on("close", () => {
+    client.closed = true;
+    clients.delete(client.id);
+    disconnectClient(client, "disconnect");
+  });
+
+  ws.on("error", () => {
+    client.closed = true;
+    clients.delete(client.id);
+    disconnectClient(client, "disconnect");
+  });
+});
+
+server.on("upgrade", (request, socket, head) => {
   if (request.url !== "/ws") {
     socket.destroy();
     return;
   }
 
-  const key = request.headers["sec-websocket-key"];
-  if (!key) {
-    socket.destroy();
-    return;
-  }
-
-  const accept = crypto.createHash("sha1").update(`${key}${WS_GUID}`).digest("base64");
-  socket.write(
-    [
-      "HTTP/1.1 101 Switching Protocols",
-      "Upgrade: websocket",
-      "Connection: Upgrade",
-      `Sec-WebSocket-Accept: ${accept}`,
-      "",
-      "",
-    ].join("\r\n"),
-  );
-
-  const client = createWebSocketClient(socket);
-  clients.set(client.id, client);
-  sendMessage(client, {
-    type: "welcome",
-    clientId: client.id,
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
   });
-
-  socket.on("data", (chunk) => handleSocketData(client, chunk));
-  socket.on("close", () => destroyClient(client, "disconnect"));
-  socket.on("error", () => destroyClient(client, "disconnect"));
 });
+
+function cleanupDisconnectedPlayers() {
+  const now = Date.now();
+
+  rooms.forEach((room) => {
+    room.players.forEach((player) => {
+      if (!player.disconnectedAt || player.disconnectedAt + RECONNECT_GRACE_MS > now) {
+        return;
+      }
+
+      const disconnectingHost = room.hostId === player.id;
+      room.players.delete(player.id);
+
+      if (disconnectingHost) {
+        const nextHost = Array.from(room.players.values())[0] || null;
+        room.hostId = nextHost ? nextHost.id : null;
+        room.hostUsername = nextHost ? nextHost.username : room.hostUsername;
+      }
+    });
+
+    if (room.players.size < 2 && room.game.status === "playing") {
+      room.game = {
+        status: "lobby",
+        nonce: null,
+        startedAt: null,
+        startedAtMs: null,
+      };
+      room.lastSnapshot = null;
+      broadcastRoom(room, {
+        type: "return_to_room",
+        reason: "player_left",
+      });
+    }
+
+    if (room.players.size === 0 || room.updatedAt < now - ROOM_IDLE_TTL_MS) {
+      rooms.delete(room.code);
+      return;
+    }
+
+    emitRoomState(room);
+  });
+}
+
+function cleanupState() {
+  cleanupDisconnectedPlayers();
+  database.deleteExpiredSessions(Date.now());
+}
+
+function pingClients() {
+  clients.forEach((client) => {
+    if (client.closed) {
+      clients.delete(client.id);
+      return;
+    }
+    if (!client.isAlive) {
+      try {
+        client.ws.terminate();
+      } catch (error) {}
+      clients.delete(client.id);
+      disconnectClient(client, "ping_timeout");
+      return;
+    }
+    client.isAlive = false;
+    try {
+      client.ws.ping();
+    } catch (error) {
+      clients.delete(client.id);
+      disconnectClient(client, "ping_failed");
+    }
+  });
+}
 
 server.listen(PORT, HOST, () => {
-  ensureDirectory(path.dirname(ACCOUNTS_FILE));
+  ensureDirectory(path.dirname(DB_FILE));
   console.log(`[server] listening on http://127.0.0.1:${PORT}/index.html`);
   console.log(`[server] health check on http://127.0.0.1:${PORT}/healthz`);
-  console.log(`[server] accounts file: ${ACCOUNTS_FILE}`);
+  console.log(`[server] database file: ${DB_FILE}`);
+  console.log(`[server] reconnect grace: ${RECONNECT_GRACE_MS}ms`);
 });
 
-setInterval(cleanupIdleRooms, ROOM_CLEANUP_INTERVAL_MS).unref();
+setInterval(cleanupState, ROOM_CLEANUP_INTERVAL_MS).unref();
 setInterval(pingClients, CLIENT_PING_INTERVAL_MS).unref();
 
-process.on("SIGINT", () => {
-  for (const client of clients.values()) {
-    closeSocket(client);
-  }
+function shutdown() {
+  clients.forEach((client) => {
+    try {
+      client.ws.close(1001, "server_shutdown");
+    } catch (error) {}
+  });
+  try {
+    database.close();
+  } catch (error) {}
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", () => {
-  for (const client of clients.values()) {
-    closeSocket(client);
-  }
-  process.exit(0);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

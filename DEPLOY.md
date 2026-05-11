@@ -27,6 +27,9 @@ Recommended environment variables:
 PORT=8005
 HOST=0.0.0.0
 DATA_DIR=/var/lib/fireboy-online
+DB_FILE=/var/lib/fireboy-online/fireboy-online.sqlite
+SESSION_TTL_MS=2592000000
+RECONNECT_GRACE_MS=60000
 ```
 
 ## Nginx reverse proxy example
@@ -91,13 +94,13 @@ docker run -d \
 
 ## Persistence
 
-Online room progress is stored in:
+Account data, sessions, and progress are stored in SQLite:
 
 ```text
-online-progress.json
+/var/lib/fireboy-online/fireboy-online.sqlite
 ```
 
-For production, mount a persistent disk or set `DATA_DIR` to a durable directory.
+For production, mount a persistent disk or point `DATA_DIR` / `DB_FILE` to durable storage.
 
 ## Health check
 
@@ -109,14 +112,15 @@ Expected response includes:
 - `ok`
 - `activeRooms`
 - `activeClients`
-- `progressFile`
+- `accounts`
+- `dbFile`
 
 ## Important current limitations
 
 This version is deployable, but the multiplayer simulation is still based on:
 - one host acting as the authority
 - level snapshots broadcast to the other player
-- a single Node process with local JSON persistence
+- a single Node process with local SQLite persistence
 
 That means:
 - it is suitable for small public deployments and friend-room usage

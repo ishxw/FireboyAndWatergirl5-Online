@@ -6,12 +6,18 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test:smoke": "node scripts/test-smoke.js",
+    "test:e2e": "node scripts/e2e-full.js"
   },
   "engines": {
     "node": ">=18"
   },
   "devDependencies": {
     "playwright": "^1.59.1"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "ws": "^8.20.0"
   }
 }

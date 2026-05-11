@@ -15,10 +15,14 @@
     { id: "fb", title: "火娃", copy: "Fireboy" },
     { id: "wg", title: "水娃", copy: "Watergirl" },
   ];
+  const WS_RECONNECT_BASE_MS = 500;
+  const WS_RECONNECT_MAX_MS = 5000;
+  const QUIET_WS_TYPES = new Set(["input", "snapshot"]);
+  const MAX_PENDING_START_ATTEMPTS = 60;
+  const MAX_WAIT_FOR_GAME_ATTEMPTS = 200;
 
   const app = {
     auth: {
-      token: localStorage.getItem("fb5_online_token") || "",
       user: null,
       progressSingle: null,
       progressOnlineHost: null,
@@ -27,7 +31,9 @@
     ws: null,
     wsReady: false,
     wsAuthenticated: false,
-    clientId: null,
+    wsReconnectTimer: 0,
+    wsReconnectAttempts: 0,
+    playerId: null,
     currentRoom: null,
     selectedRole: null,
     localInputState: { left: false, right: false, up: false },
@@ -47,6 +53,7 @@
     levelMenuReadyAt: 0,
     snapshotTimer: 0,
     remoteOutcomePending: null,
+    pendingInitialSnapshot: null,
     syncMaps: {
       bodyToId: new Map(),
       idToBody: new Map(),
@@ -271,7 +278,10 @@
       return;
     }
 
-    const factor = distSq > 9 ? 0.22 : distSq > 1 ? 0.14 : 0.08;
+    const isPlayerBody = body.__isPlayerBody === true;
+    const factor = isPlayerBody
+      ? (distSq > 9 ? 0.12 : distSq > 1 ? 0.08 : 0.05)
+      : (distSq > 9 ? 0.22 : distSq > 1 ? 0.14 : 0.08);
     const stepX = dx * factor;
     const stepY = dy * factor;
     const current = body.GetPosition();
@@ -323,11 +333,24 @@
     const dy = targetState.y - current.y;
     const distSq = dx * dx + dy * dy;
     const isLocal = isLocalPlayerBody(game, id);
-    const hardSnapSq = isLocal ? 4 : 2.25;
+    const isPlayerBody = id.startsWith("player-");
+    const hardSnapSq = isLocal ? 16 : isPlayerBody ? 9 : 2.25;
     const angleDelta = normaliseAngleDelta(targetState.angle - body.GetAngleRadians());
-    const hardSnapAngle = isLocal ? 0.9 : 0.5;
+    const hardSnapAngle = isLocal ? 1.1 : isPlayerBody ? 0.7 : 0.5;
 
     body.__syncTarget = targetState;
+
+    if (isLocal && !targetState.isDying) {
+      // Let the guest trust its own local simulation under normal drift.
+      // Constantly tugging the local player back to host snapshots is the main source of visible jitter.
+      if (distSq < 9 && Math.abs(angleDelta) < 0.75) {
+        return;
+      }
+    }
+
+    if (!isLocal && isPlayerBody) {
+      updateRemotePlaybackInputFromState(targetState);
+    }
 
     if (targetState.isDying || distSq > hardSnapSq) {
       body.SetPositionXY(targetState.x, targetState.y);
@@ -393,11 +416,24 @@
     }
     const game = getGame();
     if (!game) {
+      app.pendingStartAttempts += 1;
+      if (app.pendingStartAttempts > MAX_PENDING_START_ATTEMPTS) {
+        app.pendingStartRoom = null;
+        setStatus(elements.onlineStatus, "启动联机关卡超时，请重试。", "error");
+        showLobby();
+        return;
+      }
       setTimeout(drainPendingOnlineLevelStart, 80);
       return;
     }
     if (game.state?.fading) {
       app.pendingStartAttempts += 1;
+      if (app.pendingStartAttempts > MAX_PENDING_START_ATTEMPTS) {
+        app.pendingStartRoom = null;
+        setStatus(elements.onlineStatus, "等待游戏状态切换超时，请重试。", "error");
+        showLobby();
+        return;
+      }
       setTimeout(drainPendingOnlineLevelStart, 80);
       return;
     }
@@ -409,9 +445,6 @@
 
   function request(path, options) {
     const headers = Object.assign({ "Content-Type": "application/json" }, options?.headers || {});
-    if (app.auth.token) {
-      headers.Authorization = `Bearer ${app.auth.token}`;
-    }
 
     return fetch(path, Object.assign({}, options || {}, { headers, credentials: "same-origin" })).then(async function (response) {
       const payload = await response.json().catch(function () {
@@ -437,34 +470,22 @@
     }
   }
 
-  function saveToken(token) {
-    app.auth.token = token || "";
-    if (token) {
-      localStorage.setItem("fb5_online_token", token);
-    } else {
-      localStorage.removeItem("fb5_online_token");
-    }
-  }
-
   function setAuthenticated(authPayload) {
-    saveToken(authPayload.token || app.auth.token);
     app.auth.user = authPayload.user || null;
     app.auth.progressSingle = authPayload.progressSingle || null;
     app.auth.progressOnlineHost = authPayload.progressOnlineHost || null;
-    app.wsAuthenticated = false;
-    if (app.wsReady && app.auth.token) {
-      sendWs({ type: "authenticate", token: app.auth.token });
-    }
+    reconnectWs(true);
     renderAuthState();
   }
 
   function clearAuth() {
-    saveToken("");
     app.auth.user = null;
     app.auth.progressSingle = null;
     app.auth.progressOnlineHost = null;
     app.wsAuthenticated = false;
+    app.playerId = null;
     app.pendingWsAction = null;
+    reconnectWs(true);
     renderAuthState();
   }
 
@@ -497,7 +518,14 @@
       const card = document.createElement("button");
       card.type = "button";
       card.className = `choice-card is-clickable${app.mode === mode.id ? " is-active" : ""}`;
-      card.innerHTML = `<h3 class="choice-title">${mode.title}</h3><p class="choice-copy">${mode.copy}</p>`;
+      const title = document.createElement("h3");
+      title.className = "choice-title";
+      title.textContent = mode.title;
+      const copy = document.createElement("p");
+      copy.className = "choice-copy";
+      copy.textContent = mode.copy;
+      card.appendChild(title);
+      card.appendChild(copy);
       card.addEventListener("click", function () {
         app.mode = mode.id;
         renderModeOptions();
@@ -519,13 +547,22 @@
     players.forEach(function (player) {
       const item = document.createElement("div");
       item.className = "player-chip";
-      item.innerHTML = `
-        <div>
-          <div class="player-name">${player.username}</div>
-          <div class="player-meta">${player.id === app.currentRoom.hostId ? "房主" : "玩家"}</div>
-        </div>
-        <div class="player-meta">${player.role === "fb" ? "火娃" : player.role === "wg" ? "水娃" : "未选角色"}</div>
-      `;
+      const left = document.createElement("div");
+      const name = document.createElement("div");
+      const meta = document.createElement("div");
+      const role = document.createElement("div");
+
+      name.className = "player-name";
+      name.textContent = player.username;
+      meta.className = "player-meta";
+      meta.textContent = player.id === app.currentRoom.hostId ? "房主" : "玩家";
+      role.className = "player-meta";
+      role.textContent = player.role === "fb" ? "火娃" : player.role === "wg" ? "水娃" : "未选角色";
+
+      left.appendChild(name);
+      left.appendChild(meta);
+      item.appendChild(left);
+      item.appendChild(role);
       elements.playerList.appendChild(item);
     });
   }
@@ -534,19 +571,26 @@
     elements.roleGrid.innerHTML = "";
     const players = app.currentRoom?.players || [];
     const me = players.find(function (player) {
-      return player.id === app.clientId;
+      return player.id === app.playerId;
     });
 
     ROLES.forEach(function (role) {
       const occupied = players.find(function (player) {
-        return player.role === role.id && player.id !== app.clientId;
+        return player.role === role.id && player.id !== app.playerId;
       });
       const selected = me?.role === role.id;
       const button = document.createElement("button");
       button.type = "button";
       button.disabled = !!occupied;
       button.className = `role-card ${occupied ? "is-disabled" : "is-clickable"}${selected ? " is-active" : ""}`;
-      button.innerHTML = `<h3 class="role-title">${role.title}</h3><p class="role-copy">${occupied ? `已被 ${occupied.username} 选择` : role.copy}</p>`;
+      const title = document.createElement("h3");
+      title.className = "role-title";
+      title.textContent = role.title;
+      const copy = document.createElement("p");
+      copy.className = "role-copy";
+      copy.textContent = occupied ? `已被 ${occupied.username} 选择` : role.copy;
+      button.appendChild(title);
+      button.appendChild(copy);
       button.addEventListener("click", function () {
         sendWs({ type: "select_role", role: selected ? null : role.id });
       });
@@ -569,9 +613,9 @@
 
     const room = app.currentRoom;
     const me = room.players.find(function (player) {
-      return player.id === app.clientId;
+      return player.id === app.playerId;
     });
-    const isHost = room.hostId === app.clientId;
+    const isHost = room.hostId === app.playerId;
     const roles = room.players.map(function (player) {
       return player.role;
     });
@@ -614,18 +658,16 @@
 
   function sendWs(payload) {
     if (!app.wsReady || !app.ws) {
-      setStatus(elements.onlineStatus, "房间连接尚未建立。", "error");
+      if (!QUIET_WS_TYPES.has(payload?.type)) {
+        setStatus(elements.onlineStatus, "房间连接尚未建立。", "error");
+      }
       return;
     }
-    if (payload instanceof ArrayBuffer) {
-      app.ws.send(payload);
-    } else {
-      app.ws.send(JSON.stringify(payload));
-    }
+    app.ws.send(JSON.stringify(payload));
   }
 
   function runAfterWsAuth(action) {
-    if (!app.auth.user || !app.auth.token) {
+    if (!app.auth.user) {
       setStatus(elements.onlineStatus, "请先登录账号。", "error");
       return;
     }
@@ -638,82 +680,88 @@
       return;
     }
     app.pendingWsAction = action;
-    sendWs({ type: "authenticate", token: app.auth.token });
+    sendWs({ type: "authenticate" });
     setStatus(elements.onlineStatus, "正在认证房间连接...", "success");
   }
 
-  function connectWs() {
+  function clearWsReconnectTimer() {
+    if (app.wsReconnectTimer) {
+      clearTimeout(app.wsReconnectTimer);
+      app.wsReconnectTimer = 0;
+    }
+  }
+
+  function scheduleWsReconnect() {
+    clearWsReconnectTimer();
+    const delay = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * Math.max(1, 2 ** app.wsReconnectAttempts));
+    app.wsReconnectTimer = setTimeout(function () {
+      app.wsReconnectTimer = 0;
+      connectWs();
+    }, delay);
+  }
+
+  function reconnectWs(immediate) {
+    clearWsReconnectTimer();
     if (app.ws) {
+      const currentWs = app.ws;
+      app.ws = null;
+      try {
+        currentWs.close();
+      } catch (error) {}
+    }
+    app.wsReady = false;
+    app.wsAuthenticated = false;
+    if (immediate === true) {
+      app.wsReconnectAttempts = 0;
+      connectWs();
+    }
+  }
+
+  function connectWs() {
+    if (app.ws && app.ws.readyState !== WebSocket.CLOSED) {
       return;
     }
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     app.ws = new WebSocket(`${protocol}//${location.host}/ws`);
-    app.ws.binaryType = "arraybuffer";
 
     app.ws.addEventListener("open", function () {
       app.wsReady = true;
       app.wsAuthenticated = false;
-      if (app.auth.token) {
-        sendWs({ type: "authenticate", token: app.auth.token });
-      }
+      app.wsReconnectAttempts = 0;
+      clearWsReconnectTimer();
+      sendWs({ type: "authenticate" });
       setStatus(elements.onlineStatus, "已连接到房间服务器。", "success");
     });
 
     app.ws.addEventListener("close", function () {
+      const shouldReconnect = !!app.auth.user;
+      app.ws = null;
       app.wsReady = false;
       app.wsAuthenticated = false;
       app.pendingWsAction = null;
-      app.currentRoom = null;
-      renderRoomState();
       setStatus(elements.onlineStatus, "房间连接已断开。", "error");
+      if (shouldReconnect) {
+        app.wsReconnectAttempts += 1;
+        scheduleWsReconnect();
+      } else {
+        app.currentRoom = null;
+        renderRoomState();
+      }
     });
 
     app.ws.addEventListener("message", function (event) {
-      if (event.data instanceof ArrayBuffer) {
-        handleBinaryMessage(new Uint8Array(event.data));
-        return;
-      }
-      if (ArrayBuffer.isView(event.data)) {
-        handleBinaryMessage(new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength));
-        return;
-      }
-      if (event.data instanceof Blob) {
-        const reader = new FileReader();
-        reader.onload = function () {
-          handleBinaryMessage(new Uint8Array(reader.result));
-        };
-        reader.readAsArrayBuffer(event.data);
-        return;
-      }
       const message = JSON.parse(event.data);
       handleWsMessage(message);
     });
   }
 
-  function handleBinaryMessage(data) {
-    const type = data[0];
-    if (type === 0x01) { // Snapshot
-      decodeBinarySnapshot(data);
-    } else if (type === 0x02) { // Input
-      decodeBinaryInput(data);
-    }
-  }
-
-  function decodeBinaryInput(data) {
-    return;
-  }
-
-  function decodeBinarySnapshot(data) {
-    return;
-  }
-
   function handleWsMessage(message) {
     switch (message.type) {
       case "welcome":
-        app.clientId = message.clientId;
         break;
       case "authenticated":
         app.wsAuthenticated = true;
+        app.playerId = message.playerId || app.playerId;
         setStatus(elements.onlineStatus, "房间认证完成。", "success");
         if (app.pendingWsAction) {
           const action = app.pendingWsAction;
@@ -742,18 +790,11 @@
             } catch (error) {}
           }
         }
+        app.pendingInitialSnapshot = message.snapshot || null;
         queueOnlineLevelStart(message.room);
         break;
-      case "game_retry": {
-        const game = getGame();
-        if (game && app.currentRoom) {
-          app.currentNonce = message.nonce;
-          startOnlineLevel(app.currentRoom);
-        }
-        break;
-      }
       case "return_to_room":
-        if (app.currentRoom?.hostId !== app.clientId) {
+        if (app.currentRoom?.hostId !== app.playerId) {
           prepareGuestForRemoteRoomReturn();
         } else {
           showLobby();
@@ -788,23 +829,8 @@
   }
 
   function loadTempleData() {
-    const templePaths = [
-      "elements/forest",
-      "elements/fire",
-      "elements/ice",
-      "elements/water",
-      "elements/crystal",
-      "elements/light",
-      "elements/wind",
-    ];
-
-    return Promise.all(
-      templePaths.map(function (templePath) {
-        return fetch(`data/${templePath}/temple.json`, { cache: "no-store" }).then(function (response) {
-          return response.json();
-        });
-      }),
-    ).then(function (temples) {
+    return request("/api/game-manifest", { method: "GET" }).then(function (payload) {
+      const temples = Array.isArray(payload.temples) ? payload.temples : [];
       app.levelOptions = temples
         .sort(function (left, right) {
           return (left.index || 0) - (right.index || 0);
@@ -915,25 +941,6 @@
     if (stored.gameTotalComplete !== undefined) base.gameTotalComplete = !!stored.gameTotalComplete;
 
     return base;
-  }
-
-  function convertGameProgressToStoredProgress(progressJson) {
-    const completedLevels = [];
-    const temples = cloneJson(progressJson?.temples || []);
-    temples.forEach(function (temple) {
-      (temple.levels || []).forEach(function (level) {
-        if (level?.best) {
-          completedLevels.push(`${temple.id}:${level.id}`);
-        }
-      });
-    });
-    return {
-      completedLevels,
-      temples,
-      gameComplete: !!progressJson?.gameComplete,
-      gameTotalComplete: !!progressJson?.gameTotalComplete,
-      updatedAt: new Date().toISOString(),
-    };
   }
 
   function restoreLocalProgress(game) {
@@ -1104,6 +1111,7 @@
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
+    app.pendingInitialSnapshot = null;
     restoreLocalProgress(game);
     showLobby();
   }
@@ -1161,9 +1169,9 @@
     app.serverElapsedMs = Number(room.elapsedMs || 0);
     app.authoritativeElapsedMs = app.serverElapsedMs;
     app.selectedRole = room.players.find(function (player) {
-      return player.id === app.clientId;
+      return player.id === app.playerId;
     })?.role || null;
-    app.isHostRuntime = room.hostId === app.clientId;
+    app.isHostRuntime = room.hostId === app.playerId;
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
@@ -1189,6 +1197,10 @@
     }
 
     applyAccountProgressToGame(game);
+
+    if (app.pendingInitialSnapshot && app.pendingInitialSnapshot.elapsedMs != null) {
+      app.serverElapsedMs = Number(app.pendingInitialSnapshot.elapsedMs || 0);
+    }
 
     // Always replace the level state with a fresh instance.
     // The original game does this on retry; otherwise flags like `ended`
@@ -1284,6 +1296,7 @@
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
+    app.pendingInitialSnapshot = null;
     stopResidualLevelAudio(game);
     restoreLocalProgress(game);
     showLobby();
@@ -1314,6 +1327,7 @@
     app.localInputState = { left: false, right: false, up: false };
     app.remoteInputState = { left: false, right: false, up: false };
     app.remoteOutcomePending = null;
+    app.pendingInitialSnapshot = null;
     stopResidualLevelAudio(game);
     restoreLocalProgress(game);
     resetTransitionState(game);
@@ -1417,56 +1431,44 @@
     menu.layoutContent();
   }
 
-  function saveOnlineProgress(game) {
-    if (!game?.progress || !game.__onlineMode) {
-      return Promise.resolve();
-    }
-    const progress = convertGameProgressToStoredProgress(game.progress.toJSON());
-    app.auth.progressOnlineHost = progress;
-    return request("/api/progress/save", {
-      method: "POST",
-      body: JSON.stringify({ mode: "online_host", progress }),
-    }).catch(function (error) {
-      setStatus(elements.onlineStatus, "联机进度保存失败：" + error.message, "error");
-    });
-  }
-
-  function saveSingleProgress(game) {
+  function applySingleLevelCompletion(game, progress) {
     if (!game?.progress || !game.__singlePlayerLobbyMode) {
-      return Promise.resolve();
+      return;
     }
-    const progress = convertGameProgressToStoredProgress(game.progress.toJSON());
-    app.auth.progressSingle = progress;
-    return request("/api/progress/save", {
+
+    app.auth.progressSingle = progress || null;
+    applyAccountProgressToGame(game);
+  }
+
+  function syncSingleProgressCompletion(game) {
+    if (!game?.progress || !game.__singlePlayerLobbyMode || !game.currentTemple) {
+      return;
+    }
+
+    const levelId = game.levelState?.data?.id ?? game.level?.levelData?.id;
+    if (levelId == null) {
+      return;
+    }
+
+    return request("/api/progress/mark-complete", {
       method: "POST",
-      body: JSON.stringify({ mode: "single", progress }),
+      body: JSON.stringify({
+        mode: "single",
+        templeId: game.currentTemple.id,
+        levelId: String(levelId),
+      }),
+    }).then(function (result) {
+      applySingleLevelCompletion(game, result.progress || null);
     }).catch(function (error) {
-      setStatus(elements.singleStatus, "单机进度保存失败：" + error.message, "error");
+      setStatus(elements.singleStatus, "单机关卡进度保存失败：" + error.message, "error");
     });
   }
 
-  function markCurrentOnlineLevelComplete(game) {
-    if (!game?.progress || !app.currentRoom?.selectedTempleId || app.currentRoom?.selectedLevelId == null) {
-      return;
+  function applyOnlineProgressFromServer(progress, game) {
+    app.auth.progressOnlineHost = progress || null;
+    if (game?.progress) {
+      applyAccountProgressToGame(game);
     }
-    const progressJson = cloneJson(game.progress.toJSON());
-    const temple = (progressJson.temples || []).find(function (entry) {
-      return entry.id === app.currentRoom.selectedTempleId;
-    });
-    if (!temple) {
-      return;
-    }
-    const level = (temple.levels || []).find(function (entry) {
-      return String(entry.id) === String(app.currentRoom.selectedLevelId);
-    });
-    if (!level) {
-      return;
-    }
-    level.best = { stars: 3, diamonds: 3, time: 1, silverDiamond: 1 };
-    level.played = true;
-    level.state = 4;
-    game.progress.set(progressJson);
-    game.progress.process();
   }
 
   function startSelectedOnlineLevel() {
@@ -1521,7 +1523,7 @@
     if (!game?.__onlineMode) {
       return;
     }
-    if (app.currentRoom?.hostId !== app.clientId) {
+    if (app.currentRoom?.hostId !== app.playerId) {
       setStatus(elements.onlineStatus, "等待房主操作。", "success");
       return;
     }
@@ -1545,6 +1547,9 @@
   }
 
   function handleRemoteComplete(message) {
+    if (message.progress) {
+      applyOnlineProgressFromServer(message.progress, getGame());
+    }
     queueRemoteOutcome(true, message.payload);
   }
 
@@ -1578,6 +1583,8 @@
       const id = `${prefix}:${nextId++}`;
       app.syncMaps.bodyToId.set(body, id);
       app.syncMaps.idToBody.set(id, body);
+      body.__networkBodyId = id;
+      body.__isPlayerBody = id.startsWith("player-");
     }
 
     registerBody(level.pers1?.body?.data, "player-fb");
@@ -1913,6 +1920,15 @@
       }
       this.game.stage.disableVisibilityChange = true;
       assignBodyIds(this);
+      if (app.pendingInitialSnapshot) {
+        applySnapshot({
+          nonce: app.currentNonce,
+          elapsedMs: app.pendingInitialSnapshot.elapsedMs,
+          bodies: app.pendingInitialSnapshot.bodies || [],
+          players: app.pendingInitialSnapshot.players || null,
+        });
+        app.pendingInitialSnapshot = null;
+      }
     };
 
     LevelClass.prototype.update = function () {
@@ -1927,7 +1943,7 @@
 
       if (app.isHostRuntime) {
         app.snapshotTimer += this.game.time.elapsed;
-        if (app.snapshotTimer >= 80) {
+        if (app.snapshotTimer >= 50) {
           app.snapshotTimer = 0;
           sendSnapshot(this);
         }
@@ -2005,11 +2021,13 @@
 
     const TempleSelectorClass = game.require("States/Menu/TempleSelector");
     TempleSelectorClass.prototype.templeClicked = function () {
-      if (!isMenuDelayReady()) {
+      if (this.game.__onlinePickingLevel && !isMenuDelayReady()) {
         this.didpan = false;
         return;
       }
-      armMenuDelayGuard();
+      if (this.game.__onlinePickingLevel) {
+        armMenuDelayGuard();
+      }
       return originalTempleClicked.apply(this, arguments);
     };
 
@@ -2211,7 +2229,7 @@
         if (this.__networkNavigating) {
           return;
         }
-        const isHost = !!app.currentRoom && app.currentRoom.hostId === app.clientId;
+        const isHost = !!app.currentRoom && app.currentRoom.hostId === app.playerId;
         if (isHost) {
           this.__networkNavigating = true;
           openCurrentTempleLevelMenuForHost();
@@ -2298,8 +2316,6 @@
       const result = originalEndCreate.call(this);
       if (this.game.__onlineMode) {
         if (this.levelState.success) {
-          markCurrentOnlineLevelComplete(this.game);
-          saveOnlineProgress(this.game);
           if (this.menu) {
             const buttons = getMenuButtons(this.menu);
             const continueButton = this.menu.button1 || buttons[0];
@@ -2316,8 +2332,8 @@
         } else if (!app.isHostRuntime && this.menu) {
           attachWaitingNotice(this.menu, "等待房主操作，或点击结束。");
         }
-      } else if (this.game.__singlePlayerLobbyMode) {
-        saveSingleProgress(this.game);
+      } else if (this.game.__singlePlayerLobbyMode && this.levelState.success) {
+        syncSingleProgressCompletion(this.game);
       }
       return result;
     };
@@ -2339,14 +2355,19 @@
     return window.Phaser && window.Phaser.GAMES ? window.Phaser.GAMES[0] : null;
   }
 
-  function waitForGame(callback) {
+  function waitForGame(callback, attempts) {
+    const nextAttempts = Number(attempts || 0);
     const game = getGame();
     if (game) {
       callback(game);
       return;
     }
+    if (nextAttempts >= MAX_WAIT_FOR_GAME_ATTEMPTS) {
+      setStatus(elements.authStatus, "游戏加载超时，请刷新页面重试。", "error");
+      return;
+    }
     setTimeout(function () {
-      waitForGame(callback);
+      waitForGame(callback, nextAttempts + 1);
     }, 150);
   }
 
@@ -2506,7 +2527,7 @@
     }
 
     elements.startOnlineBtn.addEventListener("click", function () {
-      if (app.currentRoom?.hostId !== app.clientId) {
+      if (app.currentRoom?.hostId !== app.playerId) {
         setStatus(elements.onlineStatus, "等待房主操作。", "success");
         return;
       }
@@ -2519,7 +2540,7 @@
 
     if (elements.reselectOnlineBtn) {
       elements.reselectOnlineBtn.addEventListener("click", function () {
-        if (app.currentRoom?.hostId !== app.clientId) {
+        if (app.currentRoom?.hostId !== app.playerId) {
           setStatus(elements.onlineStatus, "等待房主操作。", "success");
           return;
         }
@@ -2579,10 +2600,6 @@
   }
 
   async function bootAuth() {
-    if (!app.auth.token) {
-      renderAuthState();
-      return;
-    }
     try {
       const result = await request("/api/auth/me", { method: "GET" });
       app.auth.user = result.user;
